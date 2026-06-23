@@ -1,0 +1,25 @@
+services:
+  ai-limit-monitor:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ai-limit-monitor:latest
+    container_name: ai-limit-monitor
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - monitor-state:/data
+      - claude-auth:/root/.claude
+      - codex-auth:/root/.codex
+    healthcheck:
+      test: ["CMD", "uv", "run", "--no-sync", "python", "-c", "import cli"]
+      interval: 1m
+      timeout: 10s
+      retries: 3
+      start_period: 20s
+
+volumes:
+  monitor-state:
+  claude-auth:
+  codex-auth:

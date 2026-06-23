@@ -1,0 +1,46 @@
+[project]
+name = "ai-limit-monitor"
+version = "0.1.0"
+description = "Claude and Codex usage limit monitor with Telegram notifications."
+readme = "README.md"
+requires-python = ">=3.12"
+authors = [{ name = "MortalPushBot" }]
+dependencies = [
+    "httpx>=0.28.1",
+    "pydantic>=2.12.0",
+    "pydantic-settings>=2.12.0",
+    "tzdata>=2026.1",
+]
+
+[project.scripts]
+ai-limit-monitor = "cli:main"
+
+[dependency-groups]
+dev = [
+    "ruff>=0.14.0",
+]
+
+[build-system]
+requires = ["setuptools>=80.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+py-modules = ["cli", "__main__"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = [
+    "application*",
+    "config*",
+    "domain*",
+    "infrastructure*",
+    "presentation*",
+    "shared*",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]

@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+dist/
+build/
+*.egg-info/
+
+# Runtime data
+state.json
+*.log
+
+# Secrets
+.env
+.env.*
+!.env.example
+.claude/
+.codex/
+
+# IDE
+.idea/
+.vscode/
+
+# OS
+.DS_Store
