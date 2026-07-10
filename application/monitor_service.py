@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 
 import httpx
 
+from application.quota_refresh_service import ProactiveQuotaRefreshService
 from config.settings import Settings
 from domain.auth import LoginStartResult, Provider
 from domain.models import CheckResult, ProviderUsage, UsageWindow
@@ -15,6 +16,7 @@ from infrastructure.auth.cli_login import CliLoginManager
 from infrastructure.notifications.telegram import TelegramClient
 from infrastructure.providers.claude import ClaudeUsageClient
 from infrastructure.providers.codex import CodexUsageClient
+from infrastructure.providers.quota_refresh import QuotaRefreshClient
 from infrastructure.storage.json_state import MonitorState
 from presentation.telegram_formatter import (
     format_diagnostics,
@@ -42,6 +44,13 @@ class LimitMonitor:
         self._claude = ClaudeUsageClient(settings, self._http)
         self._codex = CodexUsageClient(settings, self._http)
         self._state = MonitorState.load(settings.state_path)
+        self._quota_refresh = ProactiveQuotaRefreshService(
+            self._state,
+            settings.state_path,
+            QuotaRefreshClient(),
+            claude_enabled=settings.claude_enabled,
+            codex_enabled=settings.codex_enabled,
+        )
         self._check_lock = asyncio.Lock()
 
     async def close(self) -> None:
@@ -64,6 +73,7 @@ class LimitMonitor:
 
     async def check_and_notify(self, *, force_report: bool = False) -> CheckResult:
         result = await self.check()
+        self._quota_refresh.observe(result)
         now = time.time()
         should_report = force_report or (
             self._settings.report_interval_seconds > 0
@@ -98,6 +108,10 @@ class LimitMonitor:
                 self._login_completion_loop(stop_event),
                 name="login-completion-loop",
             ),
+            asyncio.create_task(
+                self._quota_refresh.run_loop(stop_event),
+                name="quota-refresh-loop",
+            ),
         ]
         try:
             await asyncio.gather(*tasks)
@@ -127,6 +141,8 @@ class LimitMonitor:
             return await self._handle_login_command(command, text)
         if command in {"/login-code", "/login_code"}:
             return await self._handle_login_code_command(text)
+        if command == "/quota_refresh":
+            return self._handle_quota_refresh_command(text)
         return "Unknown command. Use /help."
 
     def _help_message(self) -> str:
@@ -139,8 +155,33 @@ class LimitMonitor:
             "/login_claude - 生成 Claude 登录链接\n"
             "/login_codex - 生成 Codex 登录链接和验证码\n"
             "/login_code claude CODE - 提交 Claude 登录页返回的 code\n"
+            "/quota_refresh on|off - 查看或切换限额恢复主动请求\n"
             "/ping - 健康检查"
         )
+
+    def _handle_quota_refresh_command(self, text: str) -> str:
+        parts = text.split(maxsplit=1)
+        if len(parts) == 1 or parts[1].strip().lower() == "status":
+            status = "已开启" if self._state.proactive_quota_refresh_enabled else "已关闭"
+            return f"限额恢复主动请求：{status}\n用法：/quota_refresh on|off"
+
+        option = parts[1].strip().lower()
+        if option not in {"on", "off"}:
+            return "用法：/quota_refresh on|off"
+
+        previous = self._state.proactive_quota_refresh_enabled
+        enabled = option == "on"
+        self._state.proactive_quota_refresh_enabled = enabled
+        try:
+            self._state.save(self._settings.state_path)
+        except Exception as exc:
+            self._state.proactive_quota_refresh_enabled = previous
+            logger.warning("failed to save quota refresh setting: %s", exc)
+            return "限额恢复主动请求设置保存失败，请查看容器日志。"
+
+        self._quota_refresh.notify_setting_changed()
+        status = "已开启" if enabled else "已关闭"
+        return f"限额恢复主动请求：{status}"
 
     async def _handle_login_command(self, command: str, text: str) -> str:
         provider: Provider | None = None
@@ -170,6 +211,7 @@ class LimitMonitor:
 
     async def _monitor_once_for_command(self) -> tuple[CheckResult, dict[str, LoginStartResult]]:
         result = await self.check()
+        self._quota_refresh.observe(result)
         await self._send_state_notifications(result, suppress_auth_required=True)
         logins = await self._start_login_flows_for_report(result)
         if logins:

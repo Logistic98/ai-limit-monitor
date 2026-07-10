@@ -67,6 +67,7 @@ class TelegramClient:
             {"command": "login_claude", "description": "生成 Claude 登录链接"},
             {"command": "login_codex", "description": "生成 Codex 登录链接和验证码"},
             {"command": "login_code", "description": "提交 Claude 登录 code"},
+            {"command": "quota_refresh", "description": "查看或切换限额恢复主动请求"},
             {"command": "ping", "description": "健康检查"},
             {"command": "help", "description": "显示帮助"},
         ]
