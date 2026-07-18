@@ -19,13 +19,14 @@ DEFAULT_RETRY_SECONDS = 15 * 60
 # A persistently failing CLI request would otherwise retry (and notify) forever;
 # give up on a scheduled window after this many failed attempts.
 DEFAULT_MAX_ATTEMPTS = 4
-# Claude's usage API rarely reports exactly 100% between 10-minute polls, so treat a
-# near-saturated window as triggered. A harmless extra request is sent after its reset.
-LIMIT_TRIGGER_PERCENT = 99.0
-
-
 class ProactiveQuotaRefreshService:
-    """Requests a provider immediately after any triggered limit resets."""
+    """Requests a provider immediately after any known quota window resets.
+
+    Usage percent is deliberately ignored: polling every ~10 minutes means a window
+    can climb past any watermark and reset without ever being observed there, and a
+    lightweight request after an unsaturated reset is harmless. Every window with a
+    known reset time is scheduled, so windows keep rolling over automatically.
+    """
 
     def __init__(
         self,
@@ -63,23 +64,22 @@ class ProactiveQuotaRefreshService:
             self._state.quota_refresh_last_attempt_at.pop(legacy_key, None)
 
     def observe(self, result: CheckResult) -> None:
-        """Schedule every window that has reached its limit and exposes a reset time."""
+        """Schedule a request at the reset time of every window that exposes one."""
 
         changed = False
         for provider in result.providers:
             if not provider.ok or not self._provider_enabled.get(provider.provider, False):
                 continue
             for window in provider.windows:
-                if not _limit_triggered(window):
-                    continue
                 if not window.resets_at:
-                    logger.warning(
-                        "quota refresh trigger dropped without reset time "
-                        "provider=%s window=%s used=%.1f%%",
-                        provider.provider,
-                        window.key,
-                        window.used_percent,
-                    )
+                    if window.limit_reached:
+                        logger.warning(
+                            "quota refresh trigger dropped without reset time "
+                            "provider=%s window=%s used=%.1f%%",
+                            provider.provider,
+                            window.key,
+                            window.used_percent,
+                        )
                     continue
                 key = _schedule_key(provider.provider, window)
                 reset_at = window.resets_at.timestamp()
@@ -301,10 +301,6 @@ class ProactiveQuotaRefreshService:
             self._state.save(self._state_path)
         except Exception as exc:
             logger.warning("failed to save proactive quota refresh state: %s", exc)
-
-
-def _limit_triggered(window: UsageWindow) -> bool:
-    return bool(window.limit_reached) or window.used_percent >= LIMIT_TRIGGER_PERCENT
 
 
 def _schedule_key(provider: ProviderName, window: UsageWindow) -> str:

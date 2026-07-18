@@ -11,7 +11,7 @@ import httpx
 from application.quota_refresh_service import ProactiveQuotaRefreshService
 from config.settings import Settings
 from domain.auth import LoginStartResult, Provider
-from domain.models import CheckResult, ProviderUsage, UsageWindow
+from domain.models import CheckResult, ProviderName, ProviderUsage, UsageWindow
 from infrastructure.auth.cli_login import CliLoginManager
 from infrastructure.notifications.telegram import TelegramClient
 from infrastructure.providers.claude import ClaudeUsageClient
@@ -35,6 +35,12 @@ logger = logging.getLogger(__name__)
 
 # Old alert keys ended with the window's reset marker: "provider:window_key:<epoch|unknown>".
 _LEGACY_ALERT_KEY_PATTERN = re.compile(r"^(claude|codex):.+:(\d+|unknown)$")
+
+# The usage API lags behind a successful quota refresh request: right after the CLI
+# request opens a new window, checks still return the expired one (no reset time) for
+# up to a minute. Poll until the data reflects the new window before reporting.
+_REFRESH_REPORT_RETRY_SECONDS = 15.0
+_REFRESH_REPORT_MAX_CHECKS = 6
 
 
 class LimitMonitor:
@@ -111,7 +117,7 @@ class LimitMonitor:
         )
         if not result.ok:
             return
-        check, logins = await self._monitor_once_for_command()
+        check, logins = await self._monitor_after_quota_refresh(result.provider)
         await self._telegram.send_message(format_report(check, self._settings, logins))
 
     async def send_test_message(self) -> None:
@@ -215,7 +221,7 @@ class LimitMonitor:
             if not result.ok and result.error == "already_running":
                 return f"{label} 的限额恢复请求正在执行中（自动调度已触发），请等待结果。"
             if result.ok:
-                check, logins = await self._monitor_once_for_command()
+                check, logins = await self._monitor_after_quota_refresh(option)  # type: ignore[arg-type]
                 await self._telegram.send_message(
                     format_quota_refresh_result(result.provider, result.ok, result.error),
                     chat_id=chat_id,
@@ -266,8 +272,44 @@ class LimitMonitor:
         result = await self._login_manager.submit_code("claude", parts[2])
         return format_login_complete(result)
 
-    async def _monitor_once_for_command(self) -> tuple[CheckResult, dict[str, LoginStartResult]]:
+    async def _monitor_after_quota_refresh(
+        self,
+        provider: ProviderName,
+    ) -> tuple[CheckResult, dict[str, LoginStartResult]]:
+        """Run a post-refresh monitor once the usage data reflects the new window."""
+
         result = await self.check()
+        checks = 1
+        while (
+            not _usage_reflects_refresh(result, provider)
+            and checks < _REFRESH_REPORT_MAX_CHECKS
+        ):
+            logger.info(
+                "post-refresh usage still stale provider=%s check=%s/%s, retrying in %.0fs",
+                provider,
+                checks,
+                _REFRESH_REPORT_MAX_CHECKS,
+                _REFRESH_REPORT_RETRY_SECONDS,
+            )
+            await asyncio.sleep(_REFRESH_REPORT_RETRY_SECONDS)
+            result = await self.check()
+            checks += 1
+        if not _usage_reflects_refresh(result, provider):
+            logger.warning(
+                "post-refresh usage still stale after %s checks provider=%s, "
+                "reporting anyway",
+                checks,
+                provider,
+            )
+        return await self._monitor_once_for_command(result=result)
+
+    async def _monitor_once_for_command(
+        self,
+        *,
+        result: CheckResult | None = None,
+    ) -> tuple[CheckResult, dict[str, LoginStartResult]]:
+        if result is None:
+            result = await self.check()
         self._quota_refresh.observe(result)
         await self._send_state_notifications(result, suppress_auth_required=True)
         logins = await self._start_login_flows_for_report(result)
@@ -384,6 +426,25 @@ class LimitMonitor:
             if used_percent >= threshold:
                 level = threshold
         return level
+
+
+def _usage_reflects_refresh(result: CheckResult, provider_name: ProviderName) -> bool:
+    """Whether the provider's usage data shows the newly opened quota window.
+
+    Stale data after a successful refresh request shows either the expired window
+    (reset time in the past) or no active window at all (reset time missing).
+    """
+
+    for provider in result.providers:
+        if provider.provider != provider_name:
+            continue
+        if not provider.ok or not provider.windows:
+            return False
+        return all(
+            window.resets_at is not None and window.resets_at > result.captured_at
+            for window in provider.windows
+        )
+    return False
 
 
 def _alert_key(provider: ProviderUsage, window: UsageWindow) -> str:

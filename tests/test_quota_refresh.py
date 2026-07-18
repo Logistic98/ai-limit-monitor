@@ -122,14 +122,14 @@ class ProactiveQuotaRefreshServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self._client.calls, ["claude", "claude"])
         self.assertEqual(self._state.quota_refresh_scheduled_at, {})
 
-    async def test_untriggered_or_missing_windows_do_not_schedule_requests(self) -> None:
+    async def test_windows_without_reset_time_do_not_schedule_requests(self) -> None:
         self._service.observe(
             _check_result(
                 self._now,
                 _provider_usage(
                     "claude",
                     self._now,
-                    _window("five_hour", self._now + 300, used_percent=98.9),
+                    _window("five_hour", None, used_percent=98.9),
                 ),
                 _provider_usage("codex", self._now),
             )
@@ -141,7 +141,9 @@ class ProactiveQuotaRefreshServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self._client.calls, [])
         self.assertEqual(self._state.quota_refresh_scheduled_at, {})
 
-    async def test_near_saturated_window_is_scheduled_without_limit_reached(self) -> None:
+    async def test_any_window_with_reset_time_is_scheduled_regardless_of_usage(self) -> None:
+        # Usage percent is ignored on purpose: a window polled at 92% can reset before
+        # the next check ever observes it saturated, so every known reset is scheduled.
         reset_at = self._now + 300
         self._service.observe(
             _check_result(
@@ -149,14 +151,18 @@ class ProactiveQuotaRefreshServiceTest(unittest.IsolatedAsyncioTestCase):
                 _provider_usage(
                     "claude",
                     self._now,
-                    _window("five_hour", reset_at, used_percent=99.0),
+                    _window("five_hour", reset_at, used_percent=13.0),
+                    _window("seven_day", reset_at + 600, used_percent=92.0),
                 ),
             )
         )
 
         self.assertEqual(
             self._state.quota_refresh_scheduled_at,
-            {"claude:five_hour": reset_at},
+            {
+                "claude:five_hour": reset_at,
+                "claude:seven_day": reset_at + 600,
+            },
         )
 
     async def test_stale_trigger_with_past_reset_time_is_not_rescheduled(self) -> None:
@@ -524,7 +530,7 @@ def _provider_usage(
 
 def _window(
     key: str,
-    reset_at: float,
+    reset_at: float | None,
     *,
     used_percent: float = 50.0,
     limit_reached: bool | None = None,
@@ -533,6 +539,6 @@ def _window(
         key=key,
         label=key,
         used_percent=used_percent,
-        resets_at=datetime.fromtimestamp(reset_at, tz=UTC),
+        resets_at=None if reset_at is None else datetime.fromtimestamp(reset_at, tz=UTC),
         limit_reached=limit_reached,
     )
