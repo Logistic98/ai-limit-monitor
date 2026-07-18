@@ -220,8 +220,7 @@ class CliLoginManager:
                         provider=provider,
                         ok=False,
                         message=(
-                            output.strip()
-                            or f"登录失败，退出码 {session.process.returncode}。"
+                            output.strip() or f"登录失败，退出码 {session.process.returncode}。"
                         ),
                     )
                 )

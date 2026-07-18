@@ -72,9 +72,7 @@ class ProactiveQuotaRefreshServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self._state.quota_refresh_scheduled_at, {})
 
     async def test_run_loop_wakes_at_reset_without_fixed_polling_delay(self) -> None:
-        state = MonitorState(
-            quota_refresh_scheduled_at={"claude:seven_day": time.time() + 0.05}
-        )
+        state = MonitorState(quota_refresh_scheduled_at={"claude:seven_day": time.time() + 0.05})
         client = FakeQuotaRefreshClient()
         service = ProactiveQuotaRefreshService(
             state,
@@ -131,7 +129,7 @@ class ProactiveQuotaRefreshServiceTest(unittest.IsolatedAsyncioTestCase):
                 _provider_usage(
                     "claude",
                     self._now,
-                    _window("five_hour", self._now + 300, used_percent=99.9),
+                    _window("five_hour", self._now + 300, used_percent=98.9),
                 ),
                 _provider_usage("codex", self._now),
             )
@@ -142,6 +140,76 @@ class ProactiveQuotaRefreshServiceTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(self._client.calls, [])
         self.assertEqual(self._state.quota_refresh_scheduled_at, {})
+
+    async def test_near_saturated_window_is_scheduled_without_limit_reached(self) -> None:
+        reset_at = self._now + 300
+        self._service.observe(
+            _check_result(
+                self._now,
+                _provider_usage(
+                    "claude",
+                    self._now,
+                    _window("five_hour", reset_at, used_percent=99.0),
+                ),
+            )
+        )
+
+        self.assertEqual(
+            self._state.quota_refresh_scheduled_at,
+            {"claude:five_hour": reset_at},
+        )
+
+    async def test_stale_trigger_with_past_reset_time_is_not_rescheduled(self) -> None:
+        # Right after a successful refresh the usage API can briefly keep reporting the
+        # old saturated window; rescheduling its past reset would refire immediately.
+        self._service.observe(
+            _check_result(
+                self._now,
+                _provider_usage(
+                    "claude",
+                    self._now,
+                    _window("five_hour", self._now - 1, used_percent=100.0),
+                ),
+            )
+        )
+
+        await self._service.run_due()
+
+        self.assertEqual(self._client.calls, [])
+        self.assertEqual(self._state.quota_refresh_scheduled_at, {})
+
+    async def test_on_result_callback_receives_success_and_failure(self) -> None:
+        received: list[QuotaRefreshResult] = []
+
+        async def on_result(result: QuotaRefreshResult) -> None:
+            received.append(result)
+
+        service = ProactiveQuotaRefreshService(
+            self._state,
+            self._state_path,
+            self._client,  # type: ignore[arg-type]
+            claude_enabled=True,
+            codex_enabled=True,
+            clock=lambda: self._now,
+            retry_seconds=900,
+            on_result=on_result,
+        )
+        self._state.quota_refresh_scheduled_at = {
+            "claude:five_hour": self._now,
+            "codex:codex.primary_window": self._now,
+        }
+        self._client.results["codex"] = QuotaRefreshResult(
+            provider="codex",
+            ok=False,
+            error="timeout",
+        )
+
+        await service.run_due()
+
+        self.assertEqual(
+            {(result.provider, result.ok) for result in received},
+            {("claude", True), ("codex", False)},
+        )
 
     async def test_trigger_without_reset_time_is_not_scheduled(self) -> None:
         usage = _provider_usage(
@@ -226,6 +294,199 @@ class ProactiveQuotaRefreshServiceTest(unittest.IsolatedAsyncioTestCase):
             state.quota_refresh_scheduled_at,
             {"claude:seven_day": self._now + 10},
         )
+
+
+class FailingQuotaRefreshClient:
+    def __init__(self) -> None:
+        self.calls: list[ProviderName] = []
+
+    async def request(self, provider: ProviderName) -> QuotaRefreshResult:
+        self.calls.append(provider)
+        return QuotaRefreshResult(provider=provider, ok=False, error="exit_code_1: boom")
+
+
+class QuotaRefreshGiveUpTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self._temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temporary_directory.cleanup)
+        self._state_path = Path(self._temporary_directory.name) / "state.json"
+        self._now = 1_700_000_000.0
+        self._state = MonitorState()
+        self._client = FailingQuotaRefreshClient()
+        self._results: list[QuotaRefreshResult] = []
+
+        async def on_result(result: QuotaRefreshResult) -> None:
+            self._results.append(result)
+
+        self._service = ProactiveQuotaRefreshService(
+            self._state,
+            self._state_path,
+            self._client,  # type: ignore[arg-type]
+            claude_enabled=True,
+            codex_enabled=True,
+            clock=lambda: self._now,
+            retry_seconds=900,
+            max_attempts=2,
+            on_result=on_result,
+        )
+
+    async def test_gives_up_after_max_failed_attempts(self) -> None:
+        self._state.quota_refresh_scheduled_at["claude:five_hour"] = self._now
+
+        await self._service.run_due()
+        self._now += 900
+        await self._service.run_due()
+        self._now += 900
+        await self._service.run_due()
+
+        self.assertEqual(self._client.calls, ["claude", "claude"])
+        self.assertEqual(self._state.quota_refresh_scheduled_at, {})
+        self.assertEqual(self._state.quota_refresh_attempt_counts, {})
+        self.assertEqual(
+            [(result.attempt, result.gave_up) for result in self._results],
+            [(1, False), (2, True)],
+        )
+
+    async def test_new_reset_time_clears_attempt_count(self) -> None:
+        self._state.quota_refresh_scheduled_at["claude:five_hour"] = self._now
+        await self._service.run_due()
+        self.assertEqual(self._state.quota_refresh_attempt_counts, {"claude:five_hour": 1})
+
+        new_reset = self._now + 600
+        self._service.observe(
+            _check_result(
+                self._now,
+                _provider_usage(
+                    "claude",
+                    self._now,
+                    _window("five_hour", new_reset, used_percent=100.0),
+                ),
+            )
+        )
+
+        self.assertEqual(self._state.quota_refresh_attempt_counts, {})
+        self.assertEqual(
+            self._state.quota_refresh_scheduled_at,
+            {"claude:five_hour": new_reset},
+        )
+
+
+class SlowQuotaRefreshClient:
+    """Client whose request blocks until released, for concurrency tests."""
+
+    def __init__(self) -> None:
+        self.calls: list[ProviderName] = []
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def request(self, provider: ProviderName) -> QuotaRefreshResult:
+        self.calls.append(provider)
+        self.started.set()
+        await self.release.wait()
+        return QuotaRefreshResult(provider=provider, ok=True)
+
+
+class QuotaRefreshConcurrencyTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self._temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temporary_directory.cleanup)
+        self._state_path = Path(self._temporary_directory.name) / "state.json"
+        self._state = MonitorState()
+        self._client = SlowQuotaRefreshClient()
+        self._service = ProactiveQuotaRefreshService(
+            self._state,
+            self._state_path,
+            self._client,  # type: ignore[arg-type]
+            claude_enabled=True,
+            codex_enabled=True,
+            retry_seconds=900,
+        )
+
+    async def test_manual_trigger_is_rejected_while_scheduled_request_runs(self) -> None:
+        self._state.quota_refresh_scheduled_at["claude:five_hour"] = time.time() - 1
+
+        run_task = asyncio.create_task(self._service.run_due())
+        await asyncio.wait_for(self._client.started.wait(), timeout=1)
+
+        result = await asyncio.wait_for(self._service.trigger_now("claude"), timeout=1)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.error, "already_running")
+
+        self._client.release.set()
+        await asyncio.wait_for(run_task, timeout=1)
+        self.assertEqual(self._client.calls, ["claude"])
+
+    async def test_scheduled_run_skips_provider_with_manual_request_in_flight(self) -> None:
+        trigger_task = asyncio.create_task(self._service.trigger_now("claude"))
+        await asyncio.wait_for(self._client.started.wait(), timeout=1)
+
+        self._state.quota_refresh_scheduled_at["claude:five_hour"] = time.time() - 1
+        await asyncio.wait_for(self._service.run_due(), timeout=1)
+        self.assertEqual(self._client.calls, ["claude"])
+
+        self._client.release.set()
+        result = await asyncio.wait_for(trigger_task, timeout=1)
+        self.assertTrue(result.ok)
+        # The schedule remains pending for the next loop pass.
+        self.assertIn("claude:five_hour", self._state.quota_refresh_scheduled_at)
+
+    async def test_state_lock_is_free_while_request_runs(self) -> None:
+        self._state.quota_refresh_scheduled_at["codex:codex.primary_window"] = time.time() - 1
+
+        run_task = asyncio.create_task(self._service.run_due())
+        await asyncio.wait_for(self._client.started.wait(), timeout=1)
+
+        # The snapshot path acquires nothing, but the lock itself must be available.
+        acquired = self._service._lock.locked()  # noqa: SLF001
+        self.assertFalse(acquired)
+
+        self._client.release.set()
+        await asyncio.wait_for(run_task, timeout=1)
+
+
+class QuotaRefreshClientFallbackTest(unittest.IsolatedAsyncioTestCase):
+    async def test_codex_sandbox_failure_retries_without_kernel_sandbox(self) -> None:
+        from infrastructure.providers.quota_refresh import QuotaRefreshClient
+
+        client = QuotaRefreshClient()
+        commands: list[tuple[str, ...]] = []
+
+        async def fake_run(provider: ProviderName, command: tuple[str, ...]):
+            commands.append(command)
+            if len(commands) == 1:
+                return QuotaRefreshResult(
+                    provider=provider,
+                    ok=False,
+                    error="exit_code_1: Sandbox was mandated, but Landlock is unavailable",
+                )
+            return QuotaRefreshResult(provider=provider, ok=True)
+
+        client._run = fake_run  # type: ignore[method-assign]
+        result = await client.request("codex")
+
+        self.assertTrue(result.ok)
+        self.assertEqual(len(commands), 2)
+        self.assertIn("danger-full-access", commands[1])
+
+    async def test_claude_failure_is_not_retried_without_sandbox(self) -> None:
+        from infrastructure.providers.quota_refresh import QuotaRefreshClient
+
+        client = QuotaRefreshClient()
+        commands: list[tuple[str, ...]] = []
+
+        async def fake_run(provider: ProviderName, command: tuple[str, ...]):
+            commands.append(command)
+            return QuotaRefreshResult(
+                provider=provider,
+                ok=False,
+                error="exit_code_1: Failed to authenticate",
+            )
+
+        client._run = fake_run  # type: ignore[method-assign]
+        result = await client.request("claude")
+
+        self.assertFalse(result.ok)
+        self.assertEqual(len(commands), 1)
 
 
 class QuotaRefreshCommandTest(unittest.TestCase):

@@ -97,8 +97,5 @@ def window_label_from_minutes(minutes: int | None, *, secondary: bool = False) -
 def html_escape(value: object) -> str:
     text = str(value)
     return (
-        text.replace("&", "&amp;")
-        .replace("<", "&lt;")
-        .replace(">", "&gt;")
-        .replace('"', "&quot;")
+        text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace('"', "&quot;")
     )

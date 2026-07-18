@@ -37,7 +37,6 @@ class Settings(BaseSettings):
     telegram_allowed_chat_ids: Annotated[list[str], NoDecode] = Field(default_factory=list)
 
     check_interval_seconds: int = Field(default=600, ge=30)
-    report_interval_seconds: int = Field(default=3600, ge=60)
     send_startup_report: bool = True
     alert_thresholds: Annotated[list[float], NoDecode] = Field(
         default_factory=lambda: [50, 70, 80, 90, 100]
@@ -57,7 +56,10 @@ class Settings(BaseSettings):
 
     codex_enabled: bool = True
     codex_usage_url: str = "https://chatgpt.com/backend-api/wham/usage"
+    codex_token_url: str = "https://auth.openai.com/oauth/token"
+    codex_oauth_client_id: str = "app_EMoamEEZ73f0CkXaXp7hrann"
     codex_auth_path: Path | None = Path("/root/.codex/auth.json")
+    codex_refresh_before_seconds: int = Field(default=300, ge=0)
     codex_access_token: SecretStr | None = None
     codex_account_id: str | None = None
 

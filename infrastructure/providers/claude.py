@@ -29,6 +29,7 @@ class ClaudeAuth:
     refresh_token: str | None = None
     expires_at: datetime | None = None
     credentials_path: Path | None = None
+    subscription_type: str | None = None
 
     def should_refresh(self, captured_at: datetime, refresh_before_seconds: int) -> bool:
         if not self.refresh_token or not self.expires_at:
@@ -64,6 +65,7 @@ class ClaudeUsageClient:
         if not auth.access_token:
             return self._auth_required(captured_at)
 
+        plan_type = auth.subscription_type
         refreshed_before_request = False
         if auth.should_refresh(captured_at, self._settings.claude_refresh_before_seconds):
             refresh_result = await self._refresh_access_token(auth, captured_at)
@@ -80,6 +82,7 @@ class ClaudeUsageClient:
                     ok=True,
                     captured_at=captured_at,
                     windows=[self._rate_limited_window(exc.response, captured_at)],
+                    plan_type=plan_type,
                 )
 
             is_auth_error = exc.response.status_code in {401, 403}
@@ -99,6 +102,7 @@ class ClaudeUsageClient:
                                 windows=[
                                     self._rate_limited_window(retry_exc.response, captured_at)
                                 ],
+                                plan_type=plan_type,
                             )
                         return self._http_error_usage(retry_exc, captured_at, refreshed=True)
                     except Exception as retry_exc:
@@ -107,8 +111,7 @@ class ClaudeUsageClient:
                             ok=False,
                             captured_at=captured_at,
                             error=(
-                                "Claude usage API request failed after token refresh: "
-                                f"{retry_exc}"
+                                f"Claude usage API request failed after token refresh: {retry_exc}"
                             ),
                             error_kind="request_failed",
                         )
@@ -150,6 +153,7 @@ class ClaudeUsageClient:
             captured_at=captured_at,
             windows=windows,
             credits=credits,
+            plan_type=plan_type,
             raw=payload if isinstance(payload, dict) else None,
         )
 
@@ -346,9 +350,7 @@ class ClaudeUsageClient:
         )
 
     @staticmethod
-    def _parse_rate_limit_reset(
-        response: httpx.Response, captured_at: datetime
-    ) -> datetime | None:
+    def _parse_rate_limit_reset(response: httpx.Response, captured_at: datetime) -> datetime | None:
         retry_after = response.headers.get("retry-after")
         if retry_after:
             try:
@@ -409,6 +411,7 @@ class ClaudeUsageClient:
             "has_access_token": bool(auth.access_token),
             "has_refresh_token": bool(auth.refresh_token),
             "can_auto_refresh": bool(auth.refresh_token and not self._settings.claude_token_value),
+            "plan_type": auth.subscription_type,
             "expires_at": auth.expires_at,
             "seconds_until_expiry": seconds_until_expiry,
             "refresh_before_seconds": self._settings.claude_refresh_before_seconds,
@@ -442,11 +445,13 @@ class ClaudeUsageClient:
         )
         refresh_token = _first_string(oauth, "refreshToken", "refresh_token")
         expires_at = _parse_credentials_expiry(oauth, access_token)
+        subscription_type = _first_string(oauth, "subscriptionType", "subscription_type")
         return ClaudeAuth(
             access_token=access_token,
             refresh_token=refresh_token,
             expires_at=expires_at,
             credentials_path=credentials_path,
+            subscription_type=subscription_type,
         )
 
     def _credentials_path(self) -> Path | None:
@@ -469,7 +474,6 @@ class ClaudeUsageClient:
             error_kind="auth_required",
         )
 
-    @staticmethod
     @staticmethod
     def _refresh_failure_usage(
         refresh_result: ClaudeRefreshResult,
@@ -555,8 +559,8 @@ def _safe_refresh_http_error(exc: httpx.HTTPStatusError) -> str:
             elif error:
                 description = str(error)
             if error_description:
-                description = f"{description}: {error_description}" if description else str(
-                    error_description
+                description = (
+                    f"{description}: {error_description}" if description else str(error_description)
                 )
     if not description:
         description = response.text[:200]
@@ -643,8 +647,10 @@ def _set_expiry_field(data: dict[str, Any], expires_at: datetime) -> None:
 
 def _format_expiry_like(current_value: Any, expires_at: datetime) -> int | float | str:
     if isinstance(current_value, int):
-        return int(expires_at.timestamp() * 1000) if current_value > 10_000_000_000 else int(
-            expires_at.timestamp()
+        return (
+            int(expires_at.timestamp() * 1000)
+            if current_value > 10_000_000_000
+            else int(expires_at.timestamp())
         )
     if isinstance(current_value, float):
         if current_value > 10_000_000_000:

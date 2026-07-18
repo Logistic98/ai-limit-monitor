@@ -14,10 +14,10 @@ class MonitorState:
     alert_levels: dict[str, float] = field(default_factory=dict)
     provider_errors: dict[str, bool] = field(default_factory=dict)
     provider_error_kinds: dict[str, str] = field(default_factory=dict)
-    last_report_at: float = 0.0
     proactive_quota_refresh_enabled: bool = True
     quota_refresh_scheduled_at: dict[str, float] = field(default_factory=dict)
     quota_refresh_last_attempt_at: dict[str, float] = field(default_factory=dict)
+    quota_refresh_attempt_counts: dict[str, int] = field(default_factory=dict)
     quota_refresh_last_success_at: dict[str, float] = field(default_factory=dict)
     quota_refresh_last_errors: dict[str, str] = field(default_factory=dict)
 
@@ -34,18 +34,14 @@ class MonitorState:
             alert_levels=_dict_float(data.get("alert_levels")),
             provider_errors=_dict_bool(data.get("provider_errors")),
             provider_error_kinds=_dict_str(data.get("provider_error_kinds")),
-            last_report_at=float(data.get("last_report_at") or 0.0),
             proactive_quota_refresh_enabled=_strict_bool(
                 data.get("proactive_quota_refresh_enabled"),
                 default=True,
             ),
             quota_refresh_scheduled_at=_dict_float(data.get("quota_refresh_scheduled_at")),
-            quota_refresh_last_attempt_at=_dict_float(
-                data.get("quota_refresh_last_attempt_at")
-            ),
-            quota_refresh_last_success_at=_dict_float(
-                data.get("quota_refresh_last_success_at")
-            ),
+            quota_refresh_last_attempt_at=_dict_float(data.get("quota_refresh_last_attempt_at")),
+            quota_refresh_attempt_counts=_dict_int(data.get("quota_refresh_attempt_counts")),
+            quota_refresh_last_success_at=_dict_float(data.get("quota_refresh_last_success_at")),
             quota_refresh_last_errors=_dict_str(data.get("quota_refresh_last_errors")),
         )
 
@@ -59,12 +55,10 @@ class MonitorState:
                     "alert_levels": self.alert_levels,
                     "provider_errors": self.provider_errors,
                     "provider_error_kinds": self.provider_error_kinds,
-                    "last_report_at": self.last_report_at,
-                    "proactive_quota_refresh_enabled": (
-                        self.proactive_quota_refresh_enabled
-                    ),
+                    "proactive_quota_refresh_enabled": (self.proactive_quota_refresh_enabled),
                     "quota_refresh_scheduled_at": self.quota_refresh_scheduled_at,
                     "quota_refresh_last_attempt_at": self.quota_refresh_last_attempt_at,
+                    "quota_refresh_attempt_counts": self.quota_refresh_attempt_counts,
                     "quota_refresh_last_success_at": self.quota_refresh_last_success_at,
                     "quota_refresh_last_errors": self.quota_refresh_last_errors,
                     "updated_at": time.time(),
@@ -85,6 +79,18 @@ def _dict_float(value: Any) -> dict[str, float]:
     for key, item in value.items():
         try:
             result[str(key)] = float(item)
+        except (TypeError, ValueError):
+            continue
+    return result
+
+
+def _dict_int(value: Any) -> dict[str, int]:
+    if not isinstance(value, dict):
+        return {}
+    result: dict[str, int] = {}
+    for key, item in value.items():
+        try:
+            result[str(key)] = int(item)
         except (TypeError, ValueError):
             continue
     return result

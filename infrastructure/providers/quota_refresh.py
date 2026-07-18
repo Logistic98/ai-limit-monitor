@@ -1,13 +1,25 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
+import re
 import shutil
 import signal
 import tempfile
 from dataclasses import dataclass
 
 from domain.models import ProviderName
+
+logger = logging.getLogger(__name__)
+
+# CLI error output is only used for diagnostics; keep the tail small enough for
+# Telegram messages while still carrying the actual failure reason.
+_OUTPUT_TAIL_CHARS = 300
+_ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
+# Codex mandates a kernel sandbox (Landlock/seccomp on Linux) which is often
+# unavailable inside containers; these markers identify that failure mode.
+_SANDBOX_FAILURE_MARKERS = ("landlock", "seccomp", "sandbox")
 
 
 @dataclass(frozen=True)
@@ -17,6 +29,9 @@ class QuotaRefreshResult:
     provider: ProviderName
     ok: bool
     error: str | None = None
+    attempt: int | None = None
+    max_attempts: int | None = None
+    gave_up: bool = False
 
 
 class QuotaRefreshClient:
@@ -26,7 +41,31 @@ class QuotaRefreshClient:
         self._timeout_seconds = timeout_seconds
 
     async def request(self, provider: ProviderName) -> QuotaRefreshResult:
-        command = _command_for(provider)
+        result = await self._run(provider, _command_for(provider))
+        if (
+            provider == "codex"
+            and not result.ok
+            and result.error
+            and _is_sandbox_failure(result.error)
+        ):
+            # The container itself is the isolation boundary; retry once without
+            # the kernel sandbox so the request can still go through.
+            logger.warning("codex kernel sandbox unavailable, retrying with danger-full-access")
+            fallback = await self._run(provider, _codex_command(sandbox="danger-full-access"))
+            if fallback.ok:
+                return fallback
+            return QuotaRefreshResult(
+                provider=provider,
+                ok=False,
+                error=f"{result.error} | no-sandbox retry: {fallback.error}",
+            )
+        return result
+
+    async def _run(
+        self,
+        provider: ProviderName,
+        command: tuple[str, ...],
+    ) -> QuotaRefreshResult:
         executable = shutil.which(command[0])
         if not executable:
             return QuotaRefreshResult(
@@ -40,28 +79,38 @@ class QuotaRefreshClient:
             *command[1:],
             cwd=tempfile.gettempdir(),
             stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
             start_new_session=True,
         )
         try:
-            return_code = await asyncio.wait_for(
-                process.wait(),
+            output_bytes, _ = await asyncio.wait_for(
+                process.communicate(),
                 timeout=self._timeout_seconds,
             )
         except TimeoutError:
             await _terminate_process(process)
-            return QuotaRefreshResult(provider=provider, ok=False, error="timeout")
+            return QuotaRefreshResult(
+                provider=provider,
+                ok=False,
+                error=f"timeout_{int(self._timeout_seconds)}s",
+            )
         except asyncio.CancelledError:
             await _terminate_process(process)
             raise
 
-        if return_code != 0:
-            return QuotaRefreshResult(
-                provider=provider,
-                ok=False,
-                error=f"exit_code_{return_code}",
+        if process.returncode != 0:
+            output_tail = _output_tail(output_bytes)
+            logger.warning(
+                "quota refresh command failed provider=%s exit_code=%s output=%s",
+                provider,
+                process.returncode,
+                output_tail or "<empty>",
             )
+            error = f"exit_code_{process.returncode}"
+            if output_tail:
+                error = f"{error}: {output_tail}"
+            return QuotaRefreshResult(provider=provider, ok=False, error=error)
         return QuotaRefreshResult(provider=provider, ok=True)
 
 
@@ -84,18 +133,36 @@ def _command_for(provider: ProviderName) -> tuple[str, ...]:
             "Reply with exactly OK. Do not use tools.",
             "OK",
         )
+    return _codex_command(sandbox="read-only")
+
+
+def _codex_command(*, sandbox: str) -> tuple[str, ...]:
     return (
         "codex",
         "exec",
         "--skip-git-repo-check",
         "--sandbox",
-        "read-only",
+        sandbox,
         "--color",
         "never",
         "--config",
         'model_reasoning_effort="low"',
         "Reply with exactly OK. Do not inspect files or use tools.",
     )
+
+
+def _is_sandbox_failure(error: str) -> bool:
+    lowered = error.lower()
+    return any(marker in lowered for marker in _SANDBOX_FAILURE_MARKERS)
+
+
+def _output_tail(output_bytes: bytes | None) -> str:
+    if not output_bytes:
+        return ""
+    text = output_bytes.decode("utf-8", errors="replace")
+    text = _ANSI_ESCAPE_PATTERN.sub("", text)
+    text = " ".join(text.split())
+    return text[-_OUTPUT_TAIL_CHARS:]
 
 
 async def _terminate_process(process: asyncio.subprocess.Process) -> None:

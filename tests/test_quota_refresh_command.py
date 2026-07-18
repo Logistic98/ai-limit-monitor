@@ -18,10 +18,22 @@ class QuotaRefreshTelegramCommandTest(unittest.IsolatedAsyncioTestCase):
         self._monitor = object.__new__(LimitMonitor)
         self._monitor._state = MonitorState()  # noqa: SLF001
         self._monitor._settings = SimpleNamespace(  # noqa: SLF001
-            state_path=self._state_path
+            state_path=self._state_path,
+            timezone="Asia/Shanghai",
         )
+        state = self._monitor._state  # noqa: SLF001
         self._monitor._quota_refresh = SimpleNamespace(  # noqa: SLF001
-            notify_setting_changed=lambda: None
+            notify_setting_changed=lambda: None,
+            status_snapshot=lambda: {
+                "enabled": state.proactive_quota_refresh_enabled,
+                "providers_enabled": {"claude": True, "codex": True},
+                "scheduled": {},
+                "attempt_counts": {},
+                "last_success": {},
+                "last_errors": {},
+                "retry_seconds": 900,
+                "max_attempts": 4,
+            },
         )
 
     async def test_query_and_bot_suffix_toggle_persisted_setting(self) -> None:
@@ -33,14 +45,12 @@ class QuotaRefreshTelegramCommandTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("已开启", status or "")
         self.assertIn("已关闭", disabled or "")
-        self.assertFalse(
-            MonitorState.load(self._state_path).proactive_quota_refresh_enabled
-        )
+        self.assertFalse(MonitorState.load(self._state_path).proactive_quota_refresh_enabled)
 
     async def test_invalid_option_does_not_change_setting(self) -> None:
         response = await self._monitor.handle_command("1", "/quota_refresh maybe")
 
-        self.assertEqual(response, "用法：/quota_refresh on|off")
+        self.assertIn("用法：/quota_refresh on|off", response or "")
         self.assertTrue(self._monitor._state.proactive_quota_refresh_enabled)  # noqa: SLF001
 
     async def test_save_failure_rolls_back_setting(self) -> None:

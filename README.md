@@ -62,9 +62,10 @@ ai-limit-monitor/
 /login_claude           生成 Claude 浏览器登录链接
 /login_codex            生成 Codex 浏览器登录链接和验证码
 /login_code claude CODE 提交 Claude 登录页返回的 code
-/quota_refresh           查看限额恢复主动请求状态
+/quota_refresh           查看限额恢复主动请求状态（含待执行窗口与最近结果）
 /quota_refresh on        开启限额恢复主动请求
 /quota_refresh off       关闭限额恢复主动请求
+/quota_refresh claude|codex  立即手动发起一次限额恢复请求
 /ping                   健康检查
 ```
 
@@ -124,8 +125,6 @@ TELEGRAM_ALLOWED_CHAT_IDS=
 # 监控调度配置
 # CHECK_INTERVAL_SECONDS：自动检查间隔，单位秒。
 CHECK_INTERVAL_SECONDS=600
-# REPORT_INTERVAL_SECONDS：完整报告发送间隔，单位秒。
-REPORT_INTERVAL_SECONDS=3600
 # SEND_STARTUP_REPORT：服务启动时是否立即发送一次完整报告。
 SEND_STARTUP_REPORT=true
 # ALERT_THRESHOLDS：用量告警阈值，多个值用英文逗号分隔；跨越阈值时推送完整报告。
@@ -158,11 +157,17 @@ CLAUDE_REFRESH_BEFORE_SECONDS=300
 CODEX_ENABLED=true
 # CODEX_USAGE_URL：Codex usage API 地址，一般不需要修改。
 CODEX_USAGE_URL=https://chatgpt.com/backend-api/wham/usage
+# CODEX_TOKEN_URL：Codex OAuth token 刷新地址，一般不需要修改。
+CODEX_TOKEN_URL=https://auth.openai.com/oauth/token
+# CODEX_OAUTH_CLIENT_ID：Codex CLI OAuth 客户端 ID，一般不需要修改。
+CODEX_OAUTH_CLIENT_ID=app_EMoamEEZ73f0CkXaXp7hrann
 # CODEX_AUTH_PATH：容器内 Codex CLI 登录凭据路径，不需要手动填写 access token。
 CODEX_AUTH_PATH=/root/.codex/auth.json
+# CODEX_REFRESH_BEFORE_SECONDS：Codex access token 过期前多少秒主动刷新。
+CODEX_REFRESH_BEFORE_SECONDS=300
 ```
 
-安全建议：不要把 `.env` 提交到 Git。项目已经在 `.gitignore` 中忽略 `.env` 和 `.env.*`。常规部署不需要在 `.env` 中手填 Claude 或 Codex 的 access token。Claude Code 的 access token 通常是短期 token，本服务会读取同一凭据文件中的 refresh token，在过期前自动刷新并写回凭据文件；只有 refresh token 也失效、登录被撤销或账号无权访问 usage API 时，才需要重新登录。
+安全建议：不要把 `.env` 提交到 Git。项目已经在 `.gitignore` 中忽略 `.env` 和 `.env.*`。常规部署不需要在 `.env` 中手填 Claude 或 Codex 的 access token。Claude 和 Codex 的 access token 都是短期 token，本服务会读取各自凭据文件中的 refresh token，在过期前自动刷新并写回凭据文件；只有 refresh token 也失效、登录被撤销或账号无权访问 usage API 时，才需要重新登录。
 
 ## 状态存储
 
@@ -212,14 +217,15 @@ CODEX_AUTH_PATH=/root/.codex/auth.json
 
 该功能默认开启。完整监控检查会扫描 Claude、Codex 返回的所有限额窗口；当任意窗口的 `used_percent` 达到 100%，或服务端明确返回 `limit_reached` 时，记录该窗口的重置时间。独立调度器按最早重置时间精确唤醒，到期后立即通过对应的已登录 CLI 发起一个只要求回复 `OK` 的最小请求，不再额外等待固定缓冲时间。如果同一个 provider 有多个限额在相近时间同时恢复，只合并为一次请求，另一个 provider 仍独立执行。
 
-Claude 请求禁用工具、MCP、会话持久化和 Chrome 集成，Codex 请求运行在临时目录及只读沙箱中并使用低推理强度。命令输出会被丢弃，凭据不会出现在命令参数或日志中。没有触发上限的窗口、没有重置时间的窗口以及 usage API 中缺失的窗口都不会主动发起请求。请求失败不会中断限额监控，同一 provider 默认至少间隔 15 分钟才会重试。开关、每个窗口的待执行重置时间和执行结果会持久化到 `STATE_PATH`，容器重启不会丢失。关闭功能只阻止后续请求，不会取消已经发出的 CLI 请求。
+Claude 请求禁用工具、MCP、会话持久化和 Chrome 集成，Codex 请求运行在临时目录及只读沙箱中并使用低推理强度。容器等环境中内核沙箱（Landlock/seccomp）不可用时，Codex 请求会自动降级为无内核沙箱重试一次（容器本身仍是隔离边界）。命令失败时会截取输出末尾用于诊断并出现在 Telegram 通知和日志中，凭据不会出现在命令参数中。没有触发上限的窗口、没有重置时间的窗口以及 usage API 中缺失的窗口都不会主动发起请求。请求失败不会中断限额监控，同一 provider 默认至少间隔 15 分钟重试一次，同一窗口最多尝试 4 次后放弃并通知。开关、每个窗口的待执行重置时间、失败次数和执行结果会持久化到 `STATE_PATH`，容器重启不会丢失。关闭功能只阻止后续请求，不会取消已经发出的 CLI 请求。
 
 Telegram 控制命令：
 
 ```text
-/quota_refresh           查看当前状态
+/quota_refresh           查看当前状态（开关、待执行窗口、失败次数、最近成功/错误）
 /quota_refresh on        开启 Claude、Codex 的限额恢复主动请求
 /quota_refresh off       关闭 Claude、Codex 的限额恢复主动请求
+/quota_refresh claude|codex  跳过调度立即发起一次请求，用于远程排查
 ```
 
 如果需要清除登录态，可以删除对应 Docker volume 后重新登录：
@@ -281,7 +287,7 @@ codex-auth    -> /root/.codex
 
 ## 通知策略
 
-服务每 `CHECK_INTERVAL_SECONDS` 秒读取一次 Claude 和 Codex 用量。默认每小时发送一次完整报告，即 `REPORT_INTERVAL_SECONDS=3600`。当某个窗口的用量跨越 `ALERT_THRESHOLDS` 中的阈值时，服务会立即推送一次完整报告作为告警（与 /monitor 形式相同）。状态保存在 `STATE_PATH` 中，因此容器重启后不会重复发送同一窗口的历史阈值告警。
+服务每 `CHECK_INTERVAL_SECONDS` 秒读取一次 Claude 和 Codex 用量，检查本身不发消息。只有以下情况会推送通知：某个窗口的用量向上跨越 `ALERT_THRESHOLDS` 中的阈值时推送一次完整报告作为告警（与 /monitor 形式相同）；限额恢复主动请求执行后推送结果；通过命令主动查询。状态保存在 `STATE_PATH` 中，因此容器重启后不会重复发送同一窗口的历史阈值告警。
 
 如果某个 provider 读取失败，会发送一次错误通知；当后续恢复成功时，会发送恢复通知。如果 Claude 反复提示需要重新登录，可以发送 `/diagnose` 查看脱敏诊断信息，重点关注 `refresh token`、`可自动刷新` 和 `token 状态`。
 

@@ -3,9 +3,11 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextlib import suppress
+from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 from domain.models import CheckResult, ProviderName, UsageWindow
 from infrastructure.providers.quota_refresh import QuotaRefreshClient, QuotaRefreshResult
@@ -14,6 +16,12 @@ from infrastructure.storage.json_state import MonitorState
 logger = logging.getLogger(__name__)
 
 DEFAULT_RETRY_SECONDS = 15 * 60
+# A persistently failing CLI request would otherwise retry (and notify) forever;
+# give up on a scheduled window after this many failed attempts.
+DEFAULT_MAX_ATTEMPTS = 4
+# Claude's usage API rarely reports exactly 100% between 10-minute polls, so treat a
+# near-saturated window as triggered. A harmless extra request is sent after its reset.
+LIMIT_TRIGGER_PERCENT = 99.0
 
 
 class ProactiveQuotaRefreshService:
@@ -29,6 +37,8 @@ class ProactiveQuotaRefreshService:
         codex_enabled: bool,
         clock: Callable[[], float] = time.time,
         retry_seconds: float = DEFAULT_RETRY_SECONDS,
+        max_attempts: int = DEFAULT_MAX_ATTEMPTS,
+        on_result: Callable[[QuotaRefreshResult], Awaitable[None]] | None = None,
     ) -> None:
         self._state = state
         self._state_path = state_path
@@ -39,8 +49,13 @@ class ProactiveQuotaRefreshService:
         }
         self._clock = clock
         self._retry_seconds = retry_seconds
+        self._max_attempts = max(1, max_attempts)
+        self._on_result = on_result
         self._lock = asyncio.Lock()
         self._wake_event = asyncio.Event()
+        # Providers with a CLI request currently running (scheduled or manual); used to
+        # avoid firing two concurrent requests for the same provider.
+        self._in_flight: set[ProviderName] = set()
 
         # Discard schedules written by the earlier provider-wide 5h-only implementation.
         for legacy_key in ("claude", "codex"):
@@ -55,14 +70,39 @@ class ProactiveQuotaRefreshService:
             if not provider.ok or not self._provider_enabled.get(provider.provider, False):
                 continue
             for window in provider.windows:
-                if not _limit_triggered(window) or not window.resets_at:
+                if not _limit_triggered(window):
+                    continue
+                if not window.resets_at:
+                    logger.warning(
+                        "quota refresh trigger dropped without reset time "
+                        "provider=%s window=%s used=%.1f%%",
+                        provider.provider,
+                        window.key,
+                        window.used_percent,
+                    )
                     continue
                 key = _schedule_key(provider.provider, window)
                 reset_at = window.resets_at.timestamp()
+                if reset_at <= self._clock():
+                    # Stale usage data can keep reporting the old saturated window right
+                    # after a refresh; rescheduling a past reset would refire immediately.
+                    logger.info(
+                        "quota refresh trigger ignored with past reset time key=%s reset_at=%s",
+                        key,
+                        window.resets_at.isoformat(),
+                    )
+                    continue
                 if self._state.quota_refresh_scheduled_at.get(key) != reset_at:
                     self._state.quota_refresh_scheduled_at[key] = reset_at
                     self._state.quota_refresh_last_attempt_at.pop(key, None)
+                    self._state.quota_refresh_attempt_counts.pop(key, None)
                     changed = True
+                    logger.info(
+                        "quota refresh scheduled key=%s used=%.1f%% reset_at=%s",
+                        key,
+                        window.used_percent,
+                        window.resets_at.isoformat(),
+                    )
 
         if changed:
             self._wake_event.set()
@@ -85,59 +125,157 @@ class ProactiveQuotaRefreshService:
             await _wait_for_stop_or_wake(stop_event, self._wake_event, timeout)
 
     async def run_due(self) -> None:
+        finished = await self._run_due_once()
+        if not self._on_result:
+            return
+        for result in finished:
+            try:
+                await self._on_result(result)
+            except Exception:
+                logger.exception(
+                    "quota refresh result callback failed provider=%s",
+                    result.provider,
+                )
+
+    async def _run_due_once(self) -> list[QuotaRefreshResult]:
+        # The state lock is only held while selecting work and applying results;
+        # CLI requests run unlocked so manual triggers and toggles never wait on them.
         async with self._lock:
-            if not self._state.proactive_quota_refresh_enabled:
-                return
-
-            now = self._clock()
-            due_by_provider: dict[ProviderName, dict[str, float]] = {}
-            for key, reset_at in self._state.quota_refresh_scheduled_at.items():
-                provider = _provider_from_schedule_key(key)
-                if provider is None or not self._provider_enabled[provider] or now < reset_at:
-                    continue
-                last_attempt = self._state.quota_refresh_last_attempt_at.get(key, 0.0)
-                if now < last_attempt + self._retry_seconds:
-                    continue
-                due_by_provider.setdefault(provider, {})[key] = reset_at
-
+            due_by_provider = self._select_due()
             if not due_by_provider:
-                return
-
-            for due_windows in due_by_provider.values():
+                return []
+            now = self._clock()
+            for provider, due_windows in due_by_provider.items():
                 for key in due_windows:
                     self._state.quota_refresh_last_attempt_at[key] = now
+                self._in_flight.add(provider)
             self._save_state()
 
-            providers = list(due_by_provider)
+        providers = list(due_by_provider)
+        try:
             results = await asyncio.gather(
                 *(self._client.request(provider) for provider in providers),
                 return_exceptions=True,
             )
-            finished_at = self._clock()
-            for provider, result in zip(providers, results, strict=True):
-                if isinstance(result, BaseException):
-                    result = QuotaRefreshResult(
-                        provider=provider,
-                        ok=False,
-                        error=result.__class__.__name__,
-                    )
+            async with self._lock:
+                return self._apply_results(providers, results, due_by_provider)
+        finally:
+            for provider in providers:
+                self._in_flight.discard(provider)
+
+    def _select_due(self) -> dict[ProviderName, dict[str, float]]:
+        if not self._state.proactive_quota_refresh_enabled:
+            return {}
+
+        now = self._clock()
+        due_by_provider: dict[ProviderName, dict[str, float]] = {}
+        for key, reset_at in self._state.quota_refresh_scheduled_at.items():
+            provider = _provider_from_schedule_key(key)
+            if provider is None or not self._provider_enabled[provider] or now < reset_at:
+                continue
+            if provider in self._in_flight:
+                continue
+            last_attempt = self._state.quota_refresh_last_attempt_at.get(key, 0.0)
+            if now < last_attempt + self._retry_seconds:
+                continue
+            due_by_provider.setdefault(provider, {})[key] = reset_at
+        return due_by_provider
+
+    def _apply_results(
+        self,
+        providers: list[ProviderName],
+        results: list[QuotaRefreshResult | BaseException],
+        due_by_provider: dict[ProviderName, dict[str, float]],
+    ) -> list[QuotaRefreshResult]:
+        finished_at = self._clock()
+        finished: list[QuotaRefreshResult] = []
+        for provider, result in zip(providers, results, strict=True):
+            if isinstance(result, BaseException):
+                result = QuotaRefreshResult(
+                    provider=provider,
+                    ok=False,
+                    error=result.__class__.__name__,
+                )
+            if result.ok:
+                logger.info("proactive quota refresh succeeded provider=%s", provider)
+                self._state.quota_refresh_last_success_at[provider] = finished_at
+                self._state.quota_refresh_last_errors.pop(provider, None)
+                for key, reset_at in due_by_provider[provider].items():
+                    if self._state.quota_refresh_scheduled_at.get(key) == reset_at:
+                        self._state.quota_refresh_scheduled_at.pop(key, None)
+                        self._state.quota_refresh_last_attempt_at.pop(key, None)
+                    self._state.quota_refresh_attempt_counts.pop(key, None)
+            else:
+                error = result.error or "unknown"
+                attempt = 0
+                gave_up = True
+                for key in due_by_provider[provider]:
+                    count = self._state.quota_refresh_attempt_counts.get(key, 0) + 1
+                    attempt = max(attempt, count)
+                    if count >= self._max_attempts:
+                        self._state.quota_refresh_scheduled_at.pop(key, None)
+                        self._state.quota_refresh_last_attempt_at.pop(key, None)
+                        self._state.quota_refresh_attempt_counts.pop(key, None)
+                    else:
+                        self._state.quota_refresh_attempt_counts[key] = count
+                        gave_up = False
+                result = replace(
+                    result,
+                    attempt=attempt,
+                    max_attempts=self._max_attempts,
+                    gave_up=gave_up,
+                )
+                logger.warning(
+                    "proactive quota refresh failed provider=%s attempt=%s/%s "
+                    "gave_up=%s error=%s",
+                    provider,
+                    attempt,
+                    self._max_attempts,
+                    gave_up,
+                    error,
+                )
+                self._state.quota_refresh_last_errors[provider] = error
+            finished.append(result)
+        self._save_state()
+        return finished
+
+    async def trigger_now(self, provider: ProviderName) -> QuotaRefreshResult:
+        """Fire one request immediately, bypassing schedules; used for manual triggers."""
+
+        async with self._lock:
+            if provider in self._in_flight:
+                return QuotaRefreshResult(
+                    provider=provider,
+                    ok=False,
+                    error="already_running",
+                )
+            self._in_flight.add(provider)
+
+        try:
+            result = await self._client.request(provider)
+            async with self._lock:
+                finished_at = self._clock()
                 if result.ok:
-                    logger.info("proactive quota refresh succeeded provider=%s", provider)
                     self._state.quota_refresh_last_success_at[provider] = finished_at
                     self._state.quota_refresh_last_errors.pop(provider, None)
-                    for key, reset_at in due_by_provider[provider].items():
-                        if self._state.quota_refresh_scheduled_at.get(key) == reset_at:
-                            self._state.quota_refresh_scheduled_at.pop(key, None)
-                            self._state.quota_refresh_last_attempt_at.pop(key, None)
                 else:
-                    error = result.error or "unknown"
-                    logger.warning(
-                        "proactive quota refresh failed provider=%s error=%s",
-                        provider,
-                        error,
-                    )
-                    self._state.quota_refresh_last_errors[provider] = error
-            self._save_state()
+                    self._state.quota_refresh_last_errors[provider] = result.error or "unknown"
+                self._save_state()
+            return result
+        finally:
+            self._in_flight.discard(provider)
+
+    def status_snapshot(self) -> dict[str, Any]:
+        return {
+            "enabled": self._state.proactive_quota_refresh_enabled,
+            "providers_enabled": dict(self._provider_enabled),
+            "scheduled": dict(self._state.quota_refresh_scheduled_at),
+            "attempt_counts": dict(self._state.quota_refresh_attempt_counts),
+            "last_success": dict(self._state.quota_refresh_last_success_at),
+            "last_errors": dict(self._state.quota_refresh_last_errors),
+            "retry_seconds": self._retry_seconds,
+            "max_attempts": self._max_attempts,
+        }
 
     def _seconds_until_next_attempt(self) -> float | None:
         if not self._state.proactive_quota_refresh_enabled:
@@ -151,6 +289,10 @@ class ProactiveQuotaRefreshService:
                 continue
             last_attempt = self._state.quota_refresh_last_attempt_at.get(key, 0.0)
             eligible_at = max(reset_at, last_attempt + self._retry_seconds)
+            if provider in self._in_flight:
+                # A request for this provider is running right now; re-check shortly
+                # instead of spinning on an already-due schedule.
+                eligible_at = max(eligible_at, now + 5.0)
             next_attempt = eligible_at if next_attempt is None else min(next_attempt, eligible_at)
         return None if next_attempt is None else max(0.0, next_attempt - now)
 
@@ -162,7 +304,7 @@ class ProactiveQuotaRefreshService:
 
 
 def _limit_triggered(window: UsageWindow) -> bool:
-    return bool(window.limit_reached) or window.used_percent >= 100.0
+    return bool(window.limit_reached) or window.used_percent >= LIMIT_TRIGGER_PERCENT
 
 
 def _schedule_key(provider: ProviderName, window: UsageWindow) -> str:

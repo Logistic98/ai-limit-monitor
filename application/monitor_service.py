@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import time
+import re
 from contextlib import suppress
 from datetime import UTC, datetime
 
@@ -16,7 +16,7 @@ from infrastructure.auth.cli_login import CliLoginManager
 from infrastructure.notifications.telegram import TelegramClient
 from infrastructure.providers.claude import ClaudeUsageClient
 from infrastructure.providers.codex import CodexUsageClient
-from infrastructure.providers.quota_refresh import QuotaRefreshClient
+from infrastructure.providers.quota_refresh import QuotaRefreshClient, QuotaRefreshResult
 from infrastructure.storage.json_state import MonitorState
 from presentation.telegram_formatter import (
     format_diagnostics,
@@ -25,11 +25,16 @@ from presentation.telegram_formatter import (
     format_login_required,
     format_login_start,
     format_login_status,
+    format_quota_refresh_result,
+    format_quota_refresh_status,
     format_recovery,
     format_report,
 )
 
 logger = logging.getLogger(__name__)
+
+# Old alert keys ended with the window's reset marker: "provider:window_key:<epoch|unknown>".
+_LEGACY_ALERT_KEY_PATTERN = re.compile(r"^(claude|codex):.+:(\d+|unknown)$")
 
 
 class LimitMonitor:
@@ -50,8 +55,17 @@ class LimitMonitor:
             QuotaRefreshClient(),
             claude_enabled=settings.claude_enabled,
             codex_enabled=settings.codex_enabled,
+            on_result=self._on_quota_refresh_result,
         )
         self._check_lock = asyncio.Lock()
+        self._manual_refresh_running: set[str] = set()
+
+        # Drop alert keys written by the earlier reset-timestamp key format; Claude's
+        # resets_at jitters between checks, which made those keys re-alert repeatedly.
+        for legacy_key in [
+            key for key in self._state.alert_levels if _LEGACY_ALERT_KEY_PATTERN.match(key)
+        ]:
+            self._state.alert_levels.pop(legacy_key, None)
 
     async def close(self) -> None:
         await self._http.aclose()
@@ -74,21 +88,31 @@ class LimitMonitor:
     async def check_and_notify(self, *, force_report: bool = False) -> CheckResult:
         result = await self.check()
         self._quota_refresh.observe(result)
-        now = time.time()
-        should_report = force_report or (
-            self._settings.report_interval_seconds > 0
-            and now - self._state.last_report_at >= self._settings.report_interval_seconds
-        )
-        await self._send_state_notifications(result, suppress_auth_required=should_report)
-        if should_report:
+        await self._send_state_notifications(result, suppress_auth_required=force_report)
+        if force_report:
             logins = await self._start_login_flows_for_report(result)
             await self._telegram.send_message(format_report(result, self._settings, logins))
-            self._state.last_report_at = now
         try:
             self._state.save(self._settings.state_path)
         except Exception as exc:
             logger.warning("failed to save monitor state: %s", exc)
         return result
+
+    async def _on_quota_refresh_result(self, result: QuotaRefreshResult) -> None:
+        await self._telegram.send_message(
+            format_quota_refresh_result(
+                result.provider,
+                result.ok,
+                result.error,
+                attempt=result.attempt,
+                max_attempts=result.max_attempts,
+                gave_up=result.gave_up,
+            )
+        )
+        if not result.ok:
+            return
+        check, logins = await self._monitor_once_for_command()
+        await self._telegram.send_message(format_report(check, self._settings, logins))
 
     async def send_test_message(self) -> None:
         await self._telegram.send_message(
@@ -136,13 +160,20 @@ class LimitMonitor:
         if command in {"/diagnose", "/debug"}:
             result = await self.check()
             claude_auth = self._claude.diagnose_auth(result.captured_at)
-            return format_diagnostics(result, self._settings, claude_auth)
+            codex_auth = self._codex.diagnose_auth(result.captured_at)
+            return format_diagnostics(
+                result,
+                self._settings,
+                claude_auth,
+                codex_auth,
+                self._quota_refresh.status_snapshot(),
+            )
         if command in {"/login", "/login_claude", "/login_codex"}:
             return await self._handle_login_command(command, text)
         if command in {"/login-code", "/login_code"}:
             return await self._handle_login_code_command(text)
         if command == "/quota_refresh":
-            return self._handle_quota_refresh_command(text)
+            return await self._handle_quota_refresh_command(chat_id, text)
         return "Unknown command. Use /help."
 
     def _help_message(self) -> str:
@@ -156,18 +187,44 @@ class LimitMonitor:
             "/login_codex - 生成 Codex 登录链接和验证码\n"
             "/login_code claude CODE - 提交 Claude 登录页返回的 code\n"
             "/quota_refresh on|off - 查看或切换限额恢复主动请求\n"
+            "/quota_refresh claude|codex - 立即手动发起一次限额恢复请求\n"
             "/ping - 健康检查"
         )
 
-    def _handle_quota_refresh_command(self, text: str) -> str:
+    async def _handle_quota_refresh_command(self, chat_id: str, text: str) -> str:
         parts = text.split(maxsplit=1)
         if len(parts) == 1 or parts[1].strip().lower() == "status":
-            status = "已开启" if self._state.proactive_quota_refresh_enabled else "已关闭"
-            return f"限额恢复主动请求：{status}\n用法：/quota_refresh on|off"
+            return format_quota_refresh_status(
+                self._quota_refresh.status_snapshot(), self._settings
+            )
 
         option = parts[1].strip().lower()
+        if option in {"claude", "codex"}:
+            label = "Claude" if option == "claude" else "Codex"
+            if option in self._manual_refresh_running:
+                return f"{label} 手动限额恢复请求正在执行中，请等待结果。"
+            self._manual_refresh_running.add(option)
+            try:
+                await self._telegram.send_message(
+                    f"已发起 {label} 限额恢复请求，最长约 2 分钟，完成后会推送结果。",
+                    chat_id=chat_id,
+                )
+                result = await self._quota_refresh.trigger_now(option)  # type: ignore[arg-type]
+            finally:
+                self._manual_refresh_running.discard(option)
+            if not result.ok and result.error == "already_running":
+                return f"{label} 的限额恢复请求正在执行中（自动调度已触发），请等待结果。"
+            if result.ok:
+                check, logins = await self._monitor_once_for_command()
+                await self._telegram.send_message(
+                    format_quota_refresh_result(result.provider, result.ok, result.error),
+                    chat_id=chat_id,
+                )
+                return format_report(check, self._settings, logins)
+            return format_quota_refresh_result(result.provider, result.ok, result.error)
+
         if option not in {"on", "off"}:
-            return "用法：/quota_refresh on|off"
+            return "用法：/quota_refresh on|off ｜ 手动触发：/quota_refresh claude|codex"
 
         previous = self._state.proactive_quota_refresh_enabled
         enabled = option == "on"
@@ -239,6 +296,7 @@ class LimitMonitor:
                 await self._send_completed_login_notifications()
                 await self.check_and_notify()
             except Exception:
+                logger.exception("monitor loop iteration failed")
                 await asyncio.sleep(5)
 
     async def _login_completion_loop(self, stop_event: asyncio.Event) -> None:
@@ -329,5 +387,7 @@ class LimitMonitor:
 
 
 def _alert_key(provider: ProviderUsage, window: UsageWindow) -> str:
-    reset_marker = int(window.resets_at.timestamp()) if window.resets_at else "unknown"
-    return f"{provider.provider}:{window.key}:{reset_marker}"
+    # resets_at is deliberately excluded: Claude's reported reset time jitters between
+    # checks, and a key change would re-fire the same threshold alert. When the window
+    # actually resets, used_percent drops and the stored level is lowered instead.
+    return f"{provider.provider}:{window.key}"

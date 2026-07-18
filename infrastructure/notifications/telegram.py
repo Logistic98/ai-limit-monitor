@@ -22,6 +22,7 @@ class TelegramClient:
         self._settings = settings
         self._http = http
         self._base_url = f"https://api.telegram.org/bot{settings.telegram_token_value}"
+        self._command_tasks: set[asyncio.Task[None]] = set()
 
     async def send_message(self, text: str, chat_id: str | None = None) -> None:
         target_chat_id = chat_id or self._settings.telegram_chat_id
@@ -161,14 +162,24 @@ class TelegramClient:
                     chat_id,
                     _safe_text(text),
                 )
-                try:
-                    reply = await handler(chat_id, text.strip())
-                    if reply:
-                        await self.send_message(reply, chat_id=chat_id)
-                except Exception:
-                    logger.exception("telegram command handling failed")
-                    with contextlib.suppress(Exception):
-                        await self.send_message("命令处理失败，请查看容器日志。", chat_id=chat_id)
+                # Handle each command in its own task so a slow command (e.g. a manual
+                # quota refresh running a provider CLI) never blocks polling.
+                task = asyncio.create_task(self._run_command(handler, chat_id, text.strip()))
+                self._command_tasks.add(task)
+                task.add_done_callback(self._command_tasks.discard)
+
+        if self._command_tasks:
+            await asyncio.gather(*self._command_tasks, return_exceptions=True)
+
+    async def _run_command(self, handler: CommandHandler, chat_id: str, text: str) -> None:
+        try:
+            reply = await handler(chat_id, text)
+            if reply:
+                await self.send_message(reply, chat_id=chat_id)
+        except Exception:
+            logger.exception("telegram command handling failed")
+            with contextlib.suppress(Exception):
+                await self.send_message("命令处理失败，请查看容器日志。", chat_id=chat_id)
 
     def _is_allowed(self, chat_id: str) -> bool:
         return chat_id in set(self._settings.telegram_allowed_chat_ids)
