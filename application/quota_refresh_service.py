@@ -10,7 +10,11 @@ from pathlib import Path
 from typing import Any
 
 from domain.models import CheckResult, ProviderName, UsageWindow
-from infrastructure.providers.quota_refresh import QuotaRefreshClient, QuotaRefreshResult
+from infrastructure.providers.quota_refresh import (
+    QuotaRefreshClient,
+    QuotaRefreshResult,
+    is_auth_failure,
+)
 from infrastructure.storage.json_state import MonitorState
 
 logger = logging.getLogger(__name__)
@@ -68,8 +72,26 @@ class ProactiveQuotaRefreshService:
 
         changed = False
         for provider in result.providers:
-            if not provider.ok or not self._provider_enabled.get(provider.provider, False):
+            if not self._provider_enabled.get(provider.provider, False):
                 continue
+            if not provider.ok:
+                # A broken login blocks scheduled CLI requests: they would fail with the
+                # same auth error and spam retry notifications until the user re-logs in.
+                if provider.error_kind == "auth_required" and not (
+                    self._state.quota_refresh_auth_blocked.get(provider.provider)
+                ):
+                    self._state.quota_refresh_auth_blocked[provider.provider] = True
+                    logger.warning(
+                        "quota refresh paused until login recovers provider=%s",
+                        provider.provider,
+                    )
+                continue
+            if self._state.quota_refresh_auth_blocked.pop(provider.provider, None):
+                changed = True
+                logger.info(
+                    "quota refresh resumed after login recovered provider=%s",
+                    provider.provider,
+                )
             for window in provider.windows:
                 if not window.resets_at:
                     if window.limit_reached:
@@ -175,6 +197,8 @@ class ProactiveQuotaRefreshService:
                 continue
             if provider in self._in_flight:
                 continue
+            if self._state.quota_refresh_auth_blocked.get(provider):
+                continue
             last_attempt = self._state.quota_refresh_last_attempt_at.get(key, 0.0)
             if now < last_attempt + self._retry_seconds:
                 continue
@@ -219,11 +243,17 @@ class ProactiveQuotaRefreshService:
                     else:
                         self._state.quota_refresh_attempt_counts[key] = count
                         gave_up = False
+                auth_blocked = is_auth_failure(error)
+                if auth_blocked:
+                    # Do not retry on a schedule the CLI cannot satisfy; requests resume
+                    # automatically once a later check sees the login working again.
+                    self._state.quota_refresh_auth_blocked[provider] = True
                 result = replace(
                     result,
                     attempt=attempt,
                     max_attempts=self._max_attempts,
                     gave_up=gave_up,
+                    auth_blocked=auth_blocked,
                 )
                 logger.warning(
                     "proactive quota refresh failed provider=%s attempt=%s/%s "
@@ -258,8 +288,13 @@ class ProactiveQuotaRefreshService:
                 if result.ok:
                     self._state.quota_refresh_last_success_at[provider] = finished_at
                     self._state.quota_refresh_last_errors.pop(provider, None)
+                    if self._state.quota_refresh_auth_blocked.pop(provider, None):
+                        self._wake_event.set()
                 else:
                     self._state.quota_refresh_last_errors[provider] = result.error or "unknown"
+                    if is_auth_failure(result.error):
+                        self._state.quota_refresh_auth_blocked[provider] = True
+                        result = replace(result, auth_blocked=True)
                 self._save_state()
             return result
         finally:
@@ -273,6 +308,7 @@ class ProactiveQuotaRefreshService:
             "attempt_counts": dict(self._state.quota_refresh_attempt_counts),
             "last_success": dict(self._state.quota_refresh_last_success_at),
             "last_errors": dict(self._state.quota_refresh_last_errors),
+            "auth_blocked": dict(self._state.quota_refresh_auth_blocked),
             "retry_seconds": self._retry_seconds,
             "max_attempts": self._max_attempts,
         }
@@ -286,6 +322,8 @@ class ProactiveQuotaRefreshService:
         for key, reset_at in self._state.quota_refresh_scheduled_at.items():
             provider = _provider_from_schedule_key(key)
             if provider is None or not self._provider_enabled[provider]:
+                continue
+            if self._state.quota_refresh_auth_blocked.get(provider):
                 continue
             last_attempt = self._state.quota_refresh_last_attempt_at.get(key, 0.0)
             eligible_at = max(reset_at, last_attempt + self._retry_seconds)

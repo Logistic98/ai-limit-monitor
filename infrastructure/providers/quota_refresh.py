@@ -20,6 +20,27 @@ _ANSI_ESCAPE_PATTERN = re.compile(r"\x1b\[[0-9;]*[a-zA-Z]")
 # Codex mandates a kernel sandbox (Landlock/seccomp on Linux) which is often
 # unavailable inside containers; these markers identify that failure mode.
 _SANDBOX_FAILURE_MARKERS = ("landlock", "seccomp", "sandbox")
+# CLI output markers that mean the provider login itself is broken; retrying the
+# request without a re-login cannot succeed.
+_AUTH_FAILURE_MARKERS = (
+    "401",
+    "unauthorized",
+    "failed to authenticate",
+    "invalid authentication",
+    "invalid_grant",
+    "refresh token expired",
+    "access token has expired",
+    "re-authenticate",
+    "please run /login",
+    "not logged in",
+)
+
+
+def is_auth_failure(error: str | None) -> bool:
+    if not error:
+        return False
+    lowered = error.lower()
+    return any(marker in lowered for marker in _AUTH_FAILURE_MARKERS)
 
 
 @dataclass(frozen=True)
@@ -32,6 +53,7 @@ class QuotaRefreshResult:
     attempt: int | None = None
     max_attempts: int | None = None
     gave_up: bool = False
+    auth_blocked: bool = False
 
 
 class QuotaRefreshClient:

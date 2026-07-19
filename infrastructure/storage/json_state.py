@@ -20,6 +20,7 @@ class MonitorState:
     quota_refresh_attempt_counts: dict[str, int] = field(default_factory=dict)
     quota_refresh_last_success_at: dict[str, float] = field(default_factory=dict)
     quota_refresh_last_errors: dict[str, str] = field(default_factory=dict)
+    quota_refresh_auth_blocked: dict[str, bool] = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: Path) -> MonitorState:
@@ -43,6 +44,7 @@ class MonitorState:
             quota_refresh_attempt_counts=_dict_int(data.get("quota_refresh_attempt_counts")),
             quota_refresh_last_success_at=_dict_float(data.get("quota_refresh_last_success_at")),
             quota_refresh_last_errors=_dict_str(data.get("quota_refresh_last_errors")),
+            quota_refresh_auth_blocked=_dict_bool(data.get("quota_refresh_auth_blocked")),
         )
 
     def save(self, path: Path) -> None:
@@ -61,6 +63,7 @@ class MonitorState:
                     "quota_refresh_attempt_counts": self.quota_refresh_attempt_counts,
                     "quota_refresh_last_success_at": self.quota_refresh_last_success_at,
                     "quota_refresh_last_errors": self.quota_refresh_last_errors,
+                    "quota_refresh_auth_blocked": self.quota_refresh_auth_blocked,
                     "updated_at": time.time(),
                 },
                 ensure_ascii=False,

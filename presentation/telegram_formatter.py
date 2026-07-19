@@ -130,6 +130,7 @@ def format_quota_refresh_result(
     attempt: int | None = None,
     max_attempts: int | None = None,
     gave_up: bool = False,
+    auth_blocked: bool = False,
 ) -> str:
     lines = [
         "<b>限额恢复主动请求</b>",
@@ -145,6 +146,8 @@ def format_quota_refresh_result(
             lines.append(f"尝试次数：{attempt}/{max_attempts}")
         if gave_up:
             lines.append("已达到最大尝试次数，本次触发不再重试。")
+        elif auth_blocked:
+            lines.append("检测到登录凭据失效，已暂停自动重试；重新登录并通过下一轮检测后会自动继续。")
         else:
             lines.append("将在冷却时间后自动重试。")
     return "\n".join(lines)
@@ -169,6 +172,12 @@ def format_quota_refresh_status(snapshot: dict[str, Any], settings: Settings) ->
             lines.append(entry)
     else:
         lines.append("待执行窗口：无")
+
+    auth_blocked = snapshot.get("auth_blocked") or {}
+    blocked_providers = sorted(name for name, blocked in auth_blocked.items() if blocked)
+    if blocked_providers:
+        labels = "、".join(_provider_label(name) for name in blocked_providers)
+        lines.append(f"因登录失效暂停：{labels}（重新登录并通过检测后自动恢复）")
 
     last_success = snapshot.get("last_success") or {}
     last_errors = snapshot.get("last_errors") or {}

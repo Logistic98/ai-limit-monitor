@@ -113,6 +113,7 @@ class LimitMonitor:
                 attempt=result.attempt,
                 max_attempts=result.max_attempts,
                 gave_up=result.gave_up,
+                auth_blocked=result.auth_blocked,
             )
         )
         if not result.ok:
@@ -227,7 +228,12 @@ class LimitMonitor:
                     chat_id=chat_id,
                 )
                 return format_report(check, self._settings, logins)
-            return format_quota_refresh_result(result.provider, result.ok, result.error)
+            return format_quota_refresh_result(
+                result.provider,
+                result.ok,
+                result.error,
+                auth_blocked=result.auth_blocked,
+            )
 
         if option not in {"on", "off"}:
             return "用法：/quota_refresh on|off ｜ 手动触发：/quota_refresh claude|codex"

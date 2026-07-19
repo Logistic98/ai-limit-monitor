@@ -302,6 +302,124 @@ class ProactiveQuotaRefreshServiceTest(unittest.IsolatedAsyncioTestCase):
         )
 
 
+class QuotaRefreshAuthGateTest(unittest.IsolatedAsyncioTestCase):
+    def setUp(self) -> None:
+        self._temporary_directory = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temporary_directory.cleanup)
+        self._state_path = Path(self._temporary_directory.name) / "state.json"
+        self._now = 1_700_000_000.0
+        self._state = MonitorState()
+        self._client = FakeQuotaRefreshClient()
+        self._results: list[QuotaRefreshResult] = []
+
+        async def on_result(result: QuotaRefreshResult) -> None:
+            self._results.append(result)
+
+        self._service = ProactiveQuotaRefreshService(
+            self._state,
+            self._state_path,
+            self._client,  # type: ignore[arg-type]
+            claude_enabled=True,
+            codex_enabled=True,
+            clock=lambda: self._now,
+            retry_seconds=900,
+            on_result=on_result,
+        )
+
+    def _observe_auth_required(self) -> None:
+        self._service.observe(
+            _check_result(
+                self._now,
+                ProviderUsage(
+                    provider="claude",
+                    ok=False,
+                    captured_at=datetime.fromtimestamp(self._now, tz=UTC),
+                    error="Claude 登录已失效",
+                    error_kind="auth_required",
+                ),
+            )
+        )
+
+    async def test_auth_required_check_blocks_scheduled_requests(self) -> None:
+        self._state.quota_refresh_scheduled_at["claude:five_hour"] = self._now
+
+        self._observe_auth_required()
+        await self._service.run_due()
+
+        self.assertEqual(self._client.calls, [])
+        self.assertIn("claude:five_hour", self._state.quota_refresh_scheduled_at)
+        self.assertIsNone(self._service._seconds_until_next_attempt())  # noqa: SLF001
+
+    async def test_passing_check_resumes_blocked_requests(self) -> None:
+        self._state.quota_refresh_scheduled_at["claude:five_hour"] = self._now
+        self._observe_auth_required()
+        await self._service.run_due()
+        self.assertEqual(self._client.calls, [])
+
+        self._service.observe(
+            _check_result(
+                self._now,
+                _provider_usage(
+                    "claude",
+                    self._now,
+                    _window("seven_day", self._now + 600, used_percent=17.0),
+                ),
+            )
+        )
+        await self._service.run_due()
+
+        self.assertEqual(self._client.calls, ["claude"])
+
+    async def test_cli_auth_failure_blocks_until_check_passes(self) -> None:
+        self._state.quota_refresh_scheduled_at["claude:five_hour"] = self._now
+        self._client.results["claude"] = QuotaRefreshResult(
+            provider="claude",
+            ok=False,
+            error="exit_code_1: Failed to authenticate. API Error: 401 Invalid credentials",
+        )
+
+        await self._service.run_due()
+        self.assertEqual(self._client.calls, ["claude"])
+        self.assertTrue(self._results[-1].auth_blocked)
+
+        # Cooldown expires but the login is still broken: no more requests.
+        self._now += 900
+        await self._service.run_due()
+        self.assertEqual(self._client.calls, ["claude"])
+
+        # A passing check clears the gate and the pending schedule fires again.
+        self._client.results["claude"] = QuotaRefreshResult(provider="claude", ok=True)
+        self._service.observe(
+            _check_result(
+                self._now,
+                _provider_usage(
+                    "claude",
+                    self._now,
+                    _window("seven_day", self._now + 600, used_percent=17.0),
+                ),
+            )
+        )
+        await self._service.run_due()
+        self.assertEqual(self._client.calls, ["claude", "claude"])
+
+    async def test_blocked_provider_does_not_gate_other_provider(self) -> None:
+        self._state.quota_refresh_scheduled_at["claude:five_hour"] = self._now
+        self._state.quota_refresh_scheduled_at["codex:codex.primary_window"] = self._now
+        self._observe_auth_required()
+
+        await self._service.run_due()
+
+        self.assertEqual(self._client.calls, ["codex"])
+
+    async def test_manual_trigger_success_clears_auth_gate(self) -> None:
+        self._state.quota_refresh_auth_blocked["claude"] = True
+
+        result = await self._service.trigger_now("claude")
+
+        self.assertTrue(result.ok)
+        self.assertEqual(self._state.quota_refresh_auth_blocked, {})
+
+
 class FailingQuotaRefreshClient:
     def __init__(self) -> None:
         self.calls: list[ProviderName] = []

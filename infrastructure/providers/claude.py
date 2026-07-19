@@ -178,6 +178,16 @@ class ClaudeUsageClient:
         auth: ClaudeAuth,
         captured_at: datetime,
     ) -> ClaudeRefreshResult:
+        # The claude CLI (proactive quota refresh / login flows) shares this credentials
+        # file and rotates the refresh token on its own refreshes. Re-read the file right
+        # before refreshing so a token rotated mid-check is not replayed, which the OAuth
+        # server rejects with invalid_grant and can invalidate the whole token family.
+        if auth.credentials_path and not self._settings.claude_token_value:
+            latest = self._load_auth()
+            if latest.refresh_token and latest.refresh_token != auth.refresh_token:
+                logger.info("claude refresh token rotated on disk, using the newer credentials")
+                auth = latest
+
         if not auth.refresh_token:
             return ClaudeRefreshResult(
                 error="Claude OAuth refresh token 不存在，需要重新登录。",
