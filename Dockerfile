@@ -11,7 +11,7 @@ ENV PYTHONUNBUFFERED=1 \
     HOME=/root
 
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends ca-certificates nodejs npm \
+    && apt-get install -y --no-install-recommends ca-certificates nodejs npm tini \
     && rm -rf /var/lib/apt/lists/*
 
 RUN npm config set registry "${NPM_REGISTRY}" \
@@ -36,4 +36,5 @@ RUN uv sync --locked --no-dev \
 
 VOLUME ["/data", "/root/.claude", "/root/.codex"]
 
-CMD ["uv", "run", "--no-sync", "ai-limit-monitor", "run"]
+ENTRYPOINT ["/usr/bin/tini", "-g", "--"]
+CMD ["/app/.venv/bin/ai-limit-monitor", "run"]

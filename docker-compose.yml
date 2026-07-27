@@ -13,9 +13,17 @@ services:
       - claude-auth:/root/.claude
       - codex-auth:/root/.codex
     healthcheck:
-      test: ["CMD", "uv", "run", "--no-sync", "python", "-c", "import cli"]
+      test:
+        - CMD-SHELL
+        - >-
+          read -r children < /proc/1/task/1/children;
+          for pid in $$children; do
+            [ "$$pid" = "$$$$" ] && continue;
+            grep -aq '/app/.venv/bin/ai-limit-monitor' "/proc/$$pid/cmdline" && exit 0;
+          done;
+          exit 1
       interval: 1m
-      timeout: 10s
+      timeout: 3s
       retries: 3
       start_period: 20s
 
