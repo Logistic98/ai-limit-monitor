@@ -64,11 +64,15 @@ class TelegramClient:
         commands = [
             {"command": "check", "description": "检查登录状态"},
             {"command": "monitor", "description": "立即监控并返回完整报告"},
-            {"command": "diagnose", "description": "输出脱敏诊断信息"},
+            {"command": "diagnose", "description": "查看登录、重置卡和自动任务诊断"},
             {"command": "login_claude", "description": "生成 Claude 登录链接"},
             {"command": "login_codex", "description": "生成 Codex 登录链接和验证码"},
             {"command": "login_code", "description": "提交 Claude 登录 code"},
             {"command": "quota_refresh", "description": "查看或切换限额恢复主动请求"},
+            {"command": "reset_codex_cards", "description": "查询 Codex 重置卡及到期时间"},
+            {"command": "reset_codex_tasks", "description": "查询 Codex 重置卡自动任务及提醒状态"},
+            {"command": "reset_codex_use", "description": "准备使用 Codex 重置卡，需二次确认"},
+            {"command": "reset_codex_auto", "description": "设置 Codex 重置卡自动使用：on 或 off"},
             {"command": "ping", "description": "健康检查"},
             {"command": "help", "description": "显示帮助"},
         ]
@@ -206,4 +210,6 @@ def _safe_text(text: str) -> str:
     command = parts[0].split("@", 1)[0].lower() if parts else ""
     if len(parts) >= 2 and command in {"/login_code", "/login-code"}:
         return f"{parts[0]} {parts[1]} ***"
+    if len(parts) >= 2 and command == "/reset_codex_use" and parts[1] == "confirm":
+        return f"{parts[0]} confirm ***"
     return text.strip()[:120]

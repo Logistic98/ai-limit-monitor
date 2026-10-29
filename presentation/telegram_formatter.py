@@ -6,13 +6,14 @@ from typing import Any
 from config.settings import Settings
 from domain.auth import LoginCompleteResult, LoginStartResult
 from domain.models import CheckResult, ProviderUsage, UsageWindow
-from shared.utils import html_escape, local_time
+from shared.utils import html_escape, local_time, parse_iso_datetime
 
 
 def format_report(
     result: CheckResult,
     settings: Settings,
     logins: dict[str, LoginStartResult] | None = None,
+    reset_credits: str | None = None,
 ) -> str:
     lines = [
         "<b>AI订阅资源限额监控</b>",
@@ -23,6 +24,8 @@ def format_report(
         login = logins.get(provider.provider) if logins else None
         lines.extend(_format_provider(provider, settings, login))
         lines.append("")
+    if reset_credits:
+        lines.append(reset_credits)
     return "\n".join(lines).strip()
 
 
@@ -32,6 +35,7 @@ def format_diagnostics(
     claude_auth: dict[str, Any],
     codex_auth: dict[str, Any],
     quota_refresh: dict[str, Any] | None = None,
+    reset_credits: str | None = None,
 ) -> str:
     lines = [
         "<b>AI订阅资源限额监控 诊断</b>",
@@ -51,8 +55,10 @@ def format_diagnostics(
             lines.extend(_format_codex_auth_diagnostics(codex_auth, settings))
         lines.append("")
 
+    if reset_credits:
+        lines.extend([reset_credits, ""])
     if quota_refresh is not None:
-        lines.append(format_quota_refresh_status(quota_refresh, settings))
+        lines.append(format_quota_refresh_status(quota_refresh, settings, include_commands=False))
         lines.append("")
     return "\n".join(lines).strip()
 
@@ -153,45 +159,75 @@ def format_quota_refresh_result(
     return "\n".join(lines)
 
 
-def format_quota_refresh_status(snapshot: dict[str, Any], settings: Settings) -> str:
+def format_quota_refresh_status(
+    snapshot: dict[str, Any], settings: Settings, *, include_commands: bool = True,
+) -> str:
+    enabled = bool(snapshot.get("enabled"))
     lines = [
         "<b>限额恢复主动请求</b>",
-        f"开关：{'已开启' if snapshot.get('enabled') else '已关闭'}",
+        f"开关：{'已开启' if enabled else '已关闭'}",
     ]
-
     scheduled = snapshot.get("scheduled") or {}
     attempt_counts = snapshot.get("attempt_counts") or {}
-    if scheduled:
-        lines.append("待执行窗口：")
-        for key in sorted(scheduled):
-            when = html_escape(_epoch_local_time(scheduled[key], settings.timezone))
-            entry = f"• {html_escape(key)} ｜ {when}"
-            count = attempt_counts.get(key)
-            if count:
-                entry = f"{entry} ｜ 已失败 {count}/{snapshot.get('max_attempts')}"
-            lines.append(entry)
-    else:
-        lines.append("待执行窗口：无")
-
     auth_blocked = snapshot.get("auth_blocked") or {}
-    blocked_providers = sorted(name for name, blocked in auth_blocked.items() if blocked)
-    if blocked_providers:
-        labels = "、".join(_provider_label(name) for name in blocked_providers)
-        lines.append(f"因登录失效暂停：{labels}（重新登录并通过检测后自动恢复）")
-
     last_success = snapshot.get("last_success") or {}
     last_errors = snapshot.get("last_errors") or {}
+    last_attempt = snapshot.get("last_attempt") or {}
+    providers_enabled = snapshot.get("providers_enabled") or {}
+    now = snapshot.get("captured_at", datetime.now(tz=UTC).timestamp())
     for provider in ("claude", "codex"):
-        parts = []
+        windows = sorted(
+            ((key, when) for key, when in scheduled.items() if key.startswith(f"{provider}:")),
+            key=lambda item: item[1],
+        )
+        blocked = auth_blocked.get(provider, False)
+        active = enabled and providers_enabled.get(provider, True) and not blocked
+        if not providers_enabled.get(provider, True):
+            status = "监控已关闭"
+        elif not enabled:
+            status = "已关闭"
+        elif blocked:
+            status = "登录失效，已暂停"
+        elif provider in (snapshot.get("in_flight") or []):
+            status = "执行中"
+        else:
+            status = "已安排" if windows else "等待检测"
+        lines.extend(["", f"<b>{_provider_label(provider)}｜{status}</b>"])
+        if active and windows and status != "执行中":
+            next_at = min(
+                max(when, last_attempt.get(key, 0) + snapshot.get("retry_seconds", 0), now)
+                for key, when in windows
+            )
+            lines.append(f"下次执行：{_epoch_local_time(next_at, settings.timezone)}")
+        for key, when in windows:
+            window = key.partition(":")[2].removeprefix(f"{provider}.")
+            label = {
+                "claude_rate_limited": "限流恢复窗口",
+                "primary_window": "主窗口", "secondary_window": "次窗口",
+                "five_hour": "5 小时窗口", "seven_day": "7 天窗口",
+                "seven_day_sonnet": "Sonnet 7 天窗口", "seven_day_opus": "Opus 7 天窗口",
+            }.get(window, window)
+            suffix = "（原定时间已过）" if when <= now and not active else ""
+            lines.append(
+                f"{html_escape(label)}：{_epoch_local_time(when, settings.timezone)}{suffix}",
+            )
+            count = attempt_counts.get(key)
+            if count:
+                lines.append(f"失败次数：{count}/{snapshot.get('max_attempts', 4)}")
+        if not windows:
+            lines.append("待执行窗口：无")
         if provider in last_success:
             when = _epoch_local_time(last_success[provider], settings.timezone)
-            parts.append(f"上次成功 {when}")
-        if provider in last_errors:
-            parts.append(f"上次错误 {last_errors[provider]}")
-        if parts:
-            lines.append(f"{_provider_label(provider)}：{html_escape(' ｜ '.join(parts))}")
-
-    lines.append("用法：/quota_refresh on|off ｜ 手动触发：/quota_refresh claude|codex")
+            lines.append(f"上次成功：{when}")
+        if blocked:
+            lines.append(f"恢复方式：{_login_command(provider)}，登录并通过检测后自动继续。")
+        elif provider in last_errors:
+            lines.append(f"最近错误：{html_escape(last_errors[provider])}")
+    if include_commands:
+        lines.extend([
+            "", "开关：/quota_refresh on 或 off",
+            "手动触发：/quota_refresh claude 或 codex",
+        ])
     return "\n".join(lines)
 
 
@@ -241,13 +277,7 @@ def _format_claude_auth_diagnostics(
     if not diagnostics.get("enabled", True):
         return ["Claude 监控：已禁用"]
 
-    expires_at = diagnostics.get("expires_at")
-    seconds_until_expiry = diagnostics.get("seconds_until_expiry")
-    if isinstance(seconds_until_expiry, int):
-        minutes = seconds_until_expiry // 60
-        expires_text = f"{local_time(expires_at, settings.timezone)}，剩余 {minutes} 分钟"
-    else:
-        expires_text = "未知"
+    expires_text = _token_expiry_text(diagnostics, settings)
 
     lines = [
         f"凭据路径：{html_escape(diagnostics.get('credentials_path') or '未找到')}",
@@ -271,13 +301,7 @@ def _format_codex_auth_diagnostics(
     if not diagnostics.get("enabled", True):
         return ["Codex 监控：已禁用"]
 
-    expires_at = diagnostics.get("expires_at")
-    seconds_until_expiry = diagnostics.get("seconds_until_expiry")
-    if isinstance(seconds_until_expiry, int):
-        minutes = seconds_until_expiry // 60
-        expires_text = f"{local_time(expires_at, settings.timezone)}，剩余 {minutes} 分钟"
-    else:
-        expires_text = "未知"
+    expires_text = _token_expiry_text(diagnostics, settings)
 
     lines = [
         f"凭据路径：{html_escape(diagnostics.get('auth_path') or '未找到')}",
@@ -290,11 +314,28 @@ def _format_codex_auth_diagnostics(
         f"提前刷新窗口：{html_escape(diagnostics.get('refresh_before_seconds') or 0)}s",
     ]
     if diagnostics.get("last_refresh"):
-        lines.append(f"上次刷新：{html_escape(diagnostics['last_refresh'])}")
+        refreshed = parse_iso_datetime(str(diagnostics["last_refresh"]))
+        when = local_time(refreshed, settings.timezone) if refreshed else diagnostics["last_refresh"]
+        lines.append(f"上次刷新：{html_escape(when)}")
     load_error = diagnostics.get("auth_load_error")
     if load_error:
         lines.append(f"凭据读取错误：{html_escape(load_error)}")
     return lines
+
+
+def _token_expiry_text(diagnostics: dict[str, Any], settings: Settings) -> str:
+    if not diagnostics.get("has_access_token"):
+        return "未登录"
+    expires_at = diagnostics.get("expires_at")
+    if not isinstance(expires_at, datetime) or expires_at.timestamp() <= 0:
+        return "未知"
+    when = local_time(expires_at, settings.timezone)
+    seconds = diagnostics.get("seconds_until_expiry")
+    if not isinstance(seconds, int):
+        return when
+    minutes = abs(seconds) // 60
+    remaining = f"已过期 {minutes} 分钟" if seconds < 0 else f"剩余 {minutes} 分钟"
+    return f"{when}，{remaining}"
 
 
 def _format_window(window: UsageWindow, settings: Settings) -> str:

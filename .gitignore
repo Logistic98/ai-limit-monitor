@@ -10,7 +10,10 @@ build/
 
 # Runtime data
 state.json
+*.reset-credits.json
+*.reset-credits.lock
 *.log
+.codegraph/
 
 # Secrets
 .env

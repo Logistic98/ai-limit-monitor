@@ -302,6 +302,9 @@ class ProactiveQuotaRefreshService:
 
     def status_snapshot(self) -> dict[str, Any]:
         return {
+            "captured_at": self._clock(),
+            "last_attempt": dict(self._state.quota_refresh_last_attempt_at),
+            "in_flight": sorted(self._in_flight),
             "enabled": self._state.proactive_quota_refresh_enabled,
             "providers_enabled": dict(self._provider_enabled),
             "scheduled": dict(self._state.quota_refresh_scheduled_at),

@@ -8,7 +8,6 @@ from contextlib import suppress
 
 from application.monitor_service import LimitMonitor
 from config.settings import Settings
-from presentation.telegram_formatter import format_report
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -25,6 +24,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     subparsers.add_parser("send-test", help="send a Telegram test message")
+    subparsers.add_parser("reset-codex-cards", help="query Codex reset credits")
+    subparsers.add_parser("reset-codex-tasks", help="query automatic Codex reset tasks")
+    use_parser = subparsers.add_parser("reset-codex-use", help="use a Codex reset credit")
+    use_parser.add_argument("--confirm", metavar="TOKEN", help="confirm a prepared reset credit")
+    auto_parser = subparsers.add_parser("reset-codex-auto", help="set automatic Codex reset use")
+    auto_parser.add_argument("enabled", choices=["on", "off"])
     return parser
 
 
@@ -49,11 +54,21 @@ async def _run(command: str, args: argparse.Namespace) -> None:
             await monitor.run_forever()
         elif command == "once":
             result = await monitor.check()
-            print(format_report(result, settings))
+            print(await monitor.report(result))
             if args.notify:
                 await monitor.check_and_notify(force_report=True)
         elif command == "send-test":
             await monitor.send_test_message()
+        elif command in {
+            "reset-codex-cards", "reset-codex-tasks", "reset-codex-use", "reset-codex-auto",
+        }:
+            options = []
+            if command == "reset-codex-use":
+                if args.confirm:
+                    options = ["confirm", args.confirm]
+            elif command == "reset-codex-auto":
+                options = [args.enabled]
+            print(await monitor.codex_reset_command("/" + command.replace("-", "_"), options))
         else:
             print(f"Unknown command: {command}", file=sys.stderr)
             raise SystemExit(2)

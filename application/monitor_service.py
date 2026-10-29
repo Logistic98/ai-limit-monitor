@@ -9,6 +9,7 @@ from datetime import UTC, datetime
 import httpx
 
 from application.quota_refresh_service import ProactiveQuotaRefreshService
+from application.reset_credit_service import ResetCreditService
 from config.settings import Settings
 from domain.auth import LoginStartResult, Provider
 from domain.models import CheckResult, ProviderName, ProviderUsage, UsageWindow
@@ -16,6 +17,7 @@ from infrastructure.auth.cli_login import CliLoginManager
 from infrastructure.notifications.telegram import TelegramClient
 from infrastructure.providers.claude import ClaudeUsageClient
 from infrastructure.providers.codex import CodexUsageClient
+from infrastructure.providers.codex_reset_credits import CodexResetCreditClient
 from infrastructure.providers.quota_refresh import QuotaRefreshClient, QuotaRefreshResult
 from infrastructure.storage.json_state import MonitorState
 from presentation.telegram_formatter import (
@@ -65,6 +67,17 @@ class LimitMonitor:
         )
         self._check_lock = asyncio.Lock()
         self._manual_refresh_running: set[str] = set()
+        self._reset_credits = ResetCreditService(
+            settings.state_path,
+            CodexResetCreditClient(settings.codex_auth_path),
+            self._telegram.send_message,
+            timezone=settings.timezone,
+            query_interval=settings.codex_reset_check_interval_seconds,
+            auto_enabled=settings.codex_reset_auto_enabled,
+            use_before_seconds=settings.codex_reset_use_before_seconds,
+            notify_before_seconds=settings.codex_reset_notify_before_seconds,
+            retry_seconds=settings.codex_reset_retry_seconds,
+        )
 
         # Drop alert keys written by the earlier reset-timestamp key format; Claude's
         # resets_at jitters between checks, which made those keys re-alert repeatedly.
@@ -75,6 +88,15 @@ class LimitMonitor:
 
     async def close(self) -> None:
         await self._http.aclose()
+
+    async def report(
+        self, result: CheckResult, logins: dict[str, LoginStartResult] | None = None,
+    ) -> str:
+        statistics = (
+            await self._reset_credits.statistics() if self._settings.codex_enabled
+            else "<b>Codex 重置卡</b>\nCodex 监控已关闭"
+        )
+        return format_report(result, self._settings, logins, reset_credits=statistics)
 
     async def check(self) -> CheckResult:
         async with self._check_lock:
@@ -97,7 +119,7 @@ class LimitMonitor:
         await self._send_state_notifications(result, suppress_auth_required=force_report)
         if force_report:
             logins = await self._start_login_flows_for_report(result)
-            await self._telegram.send_message(format_report(result, self._settings, logins))
+            await self._telegram.send_message(await self.report(result, logins))
         try:
             self._state.save(self._settings.state_path)
         except Exception as exc:
@@ -119,7 +141,7 @@ class LimitMonitor:
         if not result.ok:
             return
         check, logins = await self._monitor_after_quota_refresh(result.provider)
-        await self._telegram.send_message(format_report(check, self._settings, logins))
+        await self._telegram.send_message(await self.report(check, logins))
 
     async def send_test_message(self) -> None:
         await self._telegram.send_message(
@@ -144,6 +166,10 @@ class LimitMonitor:
                 name="quota-refresh-loop",
             ),
         ]
+        if self._settings.codex_enabled:
+            tasks.append(asyncio.create_task(
+                self._reset_credits.run_loop(stop_event), name="reset-credit-loop",
+            ))
         try:
             await asyncio.gather(*tasks)
         finally:
@@ -163,17 +189,22 @@ class LimitMonitor:
             return format_login_status(result, self._settings)
         if command == "/monitor":
             result, logins = await self._monitor_once_for_command()
-            return format_report(result, self._settings, logins)
+            return await self.report(result, logins)
         if command in {"/diagnose", "/debug"}:
             result = await self.check()
             claude_auth = self._claude.diagnose_auth(result.captured_at)
             codex_auth = self._codex.diagnose_auth(result.captured_at)
+            reset_credits = (
+                await self._reset_credits.diagnostics() if self._settings.codex_enabled
+                else "<b>Codex 重置卡</b>\nCodex 监控已关闭"
+            )
             return format_diagnostics(
                 result,
                 self._settings,
                 claude_auth,
                 codex_auth,
                 self._quota_refresh.status_snapshot(),
+                reset_credits,
             )
         if command in {"/login", "/login_claude", "/login_codex"}:
             return await self._handle_login_command(command, text)
@@ -181,6 +212,12 @@ class LimitMonitor:
             return await self._handle_login_code_command(text)
         if command == "/quota_refresh":
             return await self._handle_quota_refresh_command(chat_id, text)
+        if command in {
+            "/reset_codex_cards", "/reset_codex_tasks", "/reset_codex_use", "/reset_codex_auto",
+        }:
+            return await self.codex_reset_command(
+                command, text.split()[1:], context=f"telegram:{chat_id}",
+            )
         return "Unknown command. Use /help."
 
     def _help_message(self) -> str:
@@ -189,14 +226,41 @@ class LimitMonitor:
             "命令：\n"
             "/check - 检查 Claude 和 Codex 登录状态\n"
             "/monitor - 立即监控并返回完整报告\n"
-            "/diagnose - 输出脱敏诊断信息\n"
+            "/diagnose - 输出脱敏诊断信息，含重置卡和自动任务\n"
             "/login_claude - 生成 Claude 登录链接\n"
             "/login_codex - 生成 Codex 登录链接和验证码\n"
             "/login_code claude CODE - 提交 Claude 登录页返回的 code\n"
             "/quota_refresh on|off - 查看或切换限额恢复主动请求\n"
             "/quota_refresh claude|codex - 立即手动发起一次限额恢复请求\n"
+            "/reset_codex_cards - 查询 Codex 重置卡数量、到期及计划时间\n"
+            "/reset_codex_tasks - 查询 Codex 重置卡自动任务及提醒、重试状态\n"
+            "/reset_codex_use - 选择最近到期的重置卡，需二次确认\n"
+            "/reset_codex_auto on|off - 开启或关闭 Codex 重置卡自动使用\n"
             "/ping - 健康检查"
         )
+
+    async def codex_reset_command(
+        self, command: str, options: list[str], *, context: str = "cli",
+    ) -> str:
+        if not self._settings.codex_enabled:
+            return "Codex 监控已关闭，无法操作重置卡。"
+        if command == "/reset_codex_tasks":
+            if options:
+                return "用法：/reset_codex_tasks"
+            return await self._reset_credits.tasks()
+        if command == "/reset_codex_cards":
+            if options:
+                return "用法：/reset_codex_cards"
+            return await self._reset_credits.query()
+        if command == "/reset_codex_use":
+            if len(options) == 2 and options[0] == "confirm":
+                return await self._reset_credits.use(context=context, confirmation=options[1])
+            if options:
+                return "用法：/reset_codex_use；确认：/reset_codex_use confirm 确认码"
+            return await self._reset_credits.use(context=context)
+        if command == "/reset_codex_auto" and options in (["on"], ["off"]):
+            return await self._reset_credits.set_enabled(options[0] == "on")
+        return "用法：/reset_codex_auto on|off"
 
     async def _handle_quota_refresh_command(self, chat_id: str, text: str) -> str:
         parts = text.split(maxsplit=1)
@@ -227,7 +291,7 @@ class LimitMonitor:
                     format_quota_refresh_result(result.provider, result.ok, result.error),
                     chat_id=chat_id,
                 )
-                return format_report(check, self._settings, logins)
+                return await self.report(check, logins)
             return format_quota_refresh_result(
                 result.provider,
                 result.ok,
@@ -397,7 +461,7 @@ class LimitMonitor:
                     self._state.alert_levels[key] = threshold
 
         if threshold_crossed:
-            await self._telegram.send_message(format_report(result, self._settings))
+            await self._telegram.send_message(await self.report(result))
 
     async def _send_error_or_recovery(
         self,

@@ -3,9 +3,12 @@ __pycache__
 .pytest_cache
 .ruff_cache
 .git
+.codegraph
 .idea
 .env
 .env.*
 !.env.example
 *.log
+*.reset-credits.json
+*.reset-credits.lock
 .DS_Store

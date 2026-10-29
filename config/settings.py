@@ -62,6 +62,11 @@ class Settings(BaseSettings):
     codex_refresh_before_seconds: int = Field(default=300, ge=0)
     codex_access_token: SecretStr | None = None
     codex_account_id: str | None = None
+    codex_reset_auto_enabled: bool = True
+    codex_reset_check_interval_seconds: int = Field(default=600, ge=30)
+    codex_reset_use_before_seconds: int = Field(default=3600, ge=1)
+    codex_reset_notify_before_seconds: int = Field(default=86400, ge=0)
+    codex_reset_retry_seconds: int = Field(default=300, ge=30)
 
     @field_validator("telegram_allowed_chat_ids", mode="before")
     @classmethod

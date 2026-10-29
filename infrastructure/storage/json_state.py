@@ -21,6 +21,9 @@ class MonitorState:
     quota_refresh_last_success_at: dict[str, float] = field(default_factory=dict)
     quota_refresh_last_errors: dict[str, str] = field(default_factory=dict)
     quota_refresh_auth_blocked: dict[str, bool] = field(default_factory=dict)
+    reset_credit_auto_enabled: bool = True
+    reset_credit_jobs: dict[str, dict[str, Any]] = field(default_factory=dict)
+    reset_credit_config: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
     def load(cls, path: Path) -> MonitorState:
@@ -45,6 +48,17 @@ class MonitorState:
             quota_refresh_last_success_at=_dict_float(data.get("quota_refresh_last_success_at")),
             quota_refresh_last_errors=_dict_str(data.get("quota_refresh_last_errors")),
             quota_refresh_auth_blocked=_dict_bool(data.get("quota_refresh_auth_blocked")),
+            reset_credit_auto_enabled=_strict_bool(
+                data.get("reset_credit_auto_enabled"), default=True,
+            ),
+            reset_credit_jobs={
+                str(key): value for key, value in (data.get("reset_credit_jobs") or {}).items()
+                if isinstance(value, dict)
+            } if isinstance(data.get("reset_credit_jobs"), dict) else {},
+            reset_credit_config=(
+                data["reset_credit_config"] if isinstance(data.get("reset_credit_config"), dict)
+                else {}
+            ),
         )
 
     def save(self, path: Path) -> None:
@@ -64,6 +78,9 @@ class MonitorState:
                     "quota_refresh_last_success_at": self.quota_refresh_last_success_at,
                     "quota_refresh_last_errors": self.quota_refresh_last_errors,
                     "quota_refresh_auth_blocked": self.quota_refresh_auth_blocked,
+                    "reset_credit_auto_enabled": self.reset_credit_auto_enabled,
+                    "reset_credit_jobs": self.reset_credit_jobs,
+                    "reset_credit_config": self.reset_credit_config,
                     "updated_at": time.time(),
                 },
                 ensure_ascii=False,

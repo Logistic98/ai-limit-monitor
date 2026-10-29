@@ -58,7 +58,7 @@ ai-limit-monitor/
 /help                   显示帮助
 /check                  检查 Claude 和 Codex 登录状态
 /monitor                立即监控并返回完整报告
-/diagnose               输出脱敏诊断信息，用于排查 token 过期和自动刷新状态
+/diagnose               查看脱敏诊断，含登录、重置卡数量、自动配置和任务状态
 /login_claude           生成 Claude 浏览器登录链接
 /login_codex            生成 Codex 浏览器登录链接和验证码
 /login_code claude CODE 提交 Claude 登录页返回的 code
@@ -66,10 +66,17 @@ ai-limit-monitor/
 /quota_refresh on        开启限额恢复主动请求
 /quota_refresh off       关闭限额恢复主动请求
 /quota_refresh claude|codex  立即手动发起一次限额恢复请求
+/reset_codex_cards       查询 Codex 重置卡数量、到期时间和计划使用时间
+/reset_codex_tasks       查询自动使用任务、提醒时间和重试状态
+/reset_codex_use         选择最近到期的 Codex 重置卡，需二次确认后使用
+/reset_codex_auto on|off 开启或关闭 Codex 重置卡到期自动使用（默认开启）
 /ping                   健康检查
 ```
 
 注意：同一个 Telegram Bot token 同一时间只能有一个消息接收端。如果日志出现 `Conflict: terminated by other getUpdates request`，需要停止另一个 Bot 实例，或为本服务更换独立的 Bot token。
+
+`/monitor` 的完整报告同时包含 Codex 重置卡可用数量、自动使用开关、最近到期时间和
+计划使用时间。读取统计不会使用卡片；查询失败时仍返回 Claude、Codex 的限额报告。
 
 ## 本地开发
 
@@ -170,6 +177,67 @@ CODEX_REFRESH_BEFORE_SECONDS=300
 安全建议：不要把 `.env` 提交到 Git。项目已经在 `.gitignore` 中忽略 `.env` 和 `.env.*`。常规部署不需要在 `.env` 中手填 Claude 或 Codex 的 access token。Claude 和 Codex 的 access token 都是短期 token，本服务会读取各自凭据文件中的 refresh token，在过期前自动刷新并写回凭据文件；只有 refresh token 也失效、登录被撤销或账号无权访问 usage API 时，才需要重新登录。
 
 ## 状态存储
+
+### Codex 重置卡
+
+服务通过已登录的 `codex app-server` 查询 `account/rateLimits/read`，按服务端的
+`availableCount` 显示数量，并读取卡片 ID、发放时间和到期时间。默认每
+`CODEX_RESET_CHECK_INTERVAL_SECONDS` 秒自动查询，默认在到期前 1 小时使用指定卡片，
+不会因为普通监控检查间隔而延迟执行。没有到期时间、明细未知或状态不明确的卡不会自动使用。
+
+创建计划时、计划使用前 1 天（即到期前 25 小时）以及使用后均通过 Telegram 通知。
+首次发现时距离计划使用不足 1 天会立即补发提醒。时间使用 `TIMEZONE`，默认北京时间，
+日期不带时区缩写。
+`nothingToReset`、`noCredit` 不算使用成功，在卡片到期前每 5 分钟重试，异常会通知，
+不会退回到由服务端任选其他卡片。已到期的卡不新发起使用；网络中断导致结果不明时，
+会保留原幂等键核实同一次使用结果。
+
+以下自动使用配置同时维护在 `.env` 和 `.env.example` 中，时间参数的单位均为秒：
+
+```env
+CODEX_RESET_AUTO_ENABLED=true
+CODEX_RESET_CHECK_INTERVAL_SECONDS=600
+CODEX_RESET_USE_BEFORE_SECONDS=3600
+CODEX_RESET_NOTIFY_BEFORE_SECONDS=86400
+CODEX_RESET_RETRY_SECONDS=300
+```
+
+分别控制初始开关、查询间隔、到期前多久使用、计划使用前多久提醒以及失败重试间隔。
+修改 `.env` 后执行 `docker compose up -d --no-build --force-recreate` 生效。
+Telegram 的 `/reset_codex_auto on|off` 会立即切换并持久化运行开关；如果 `.env` 中的
+`CODEX_RESET_AUTO_ENABLED` 发生变化，新值会覆盖之前的运行开关。修改使用或提醒时间后，
+系统会重新安排计划并发送任务通知。
+
+使用 `/reset_codex_tasks` 查询当前待执行的自动任务，包括开关、调度参数、计划使用时间、
+提醒时间、提醒是否已发送以及重试或结果待确认状态。该命令直接读取持久化任务，
+不会触发查询接口或使用卡片。
+
+手动命令同样支持本地或 Docker：
+
+```bash
+uv run ai-limit-monitor reset-codex-cards
+uv run ai-limit-monitor reset-codex-tasks
+uv run ai-limit-monitor reset-codex-use
+uv run ai-limit-monitor reset-codex-use --confirm CONFIRMATION_TOKEN
+uv run ai-limit-monitor reset-codex-auto off
+docker compose exec ai-limit-monitor /app/.venv/bin/ai-limit-monitor reset-codex-cards
+```
+
+手动使用需二次确认：`/reset_codex_use` 自动选择最近到期的可用卡，显示卡片和到期时间，
+并生成一次性确认码，无需指定卡片 ID。
+在同一个 Telegram 聊天中，于 5 分钟内发送 `/reset_codex_use confirm 确认码` 才会使用。
+CLI 使用返回的 `reset-codex-use --confirm 确认码` 完成确认。确认码只能使用一次，
+重新发起请求会替换当前聊天的旧确认码；卡片已失效时不会改用其他卡片。
+未确认不会发起本次手动使用，已开启的自动到期任务仍照常执行。
+
+任务、开关、提醒去重和使用幂等键单独保存在 `STATE_PATH` 同目录的
+`state.reset-credits.json`（文件名前缀随 `STATE_PATH` 变化），进程锁防止手动命令与自动任务
+重复用卡。保留 Docker 数据卷即可在重启后恢复。只有确实收到 `reset` 或
+`alreadyRedeemed` 才通知使用成功，随后重新查询服务端状态。关闭自动使用不影响手动操作，
+已发出的使用请求仍会核实结果。`CODEX_AUTH_PATH` 应指向 CLI 的 `auth.json`。
+
+协议依据：[Codex App Server](https://learn.chatgpt.com/docs/app-server) 的
+`account/rateLimitResetCredit/consume`，需要支持 `creditId` 的 Codex CLI。
 
 项目没有使用数据库，也没有 SQLite、MySQL、PostgreSQL 之类的依赖。`STATE_PATH=/data/state.json` 只是一个轻量 JSON 状态文件，用来记录：
 
@@ -294,6 +362,11 @@ codex-auth    -> /root/.codex
 服务每 `CHECK_INTERVAL_SECONDS` 秒读取一次 Claude 和 Codex 用量，检查本身不发消息。只有以下情况会推送通知：某个窗口的用量向上跨越 `ALERT_THRESHOLDS` 中的阈值时推送一次完整报告作为告警（与 /monitor 形式相同）；限额恢复主动请求执行后推送结果；通过命令主动查询。状态保存在 `STATE_PATH` 中，因此容器重启后不会重复发送同一窗口的历史阈值告警。
 
 如果某个 provider 读取失败，会发送一次错误通知；当后续恢复成功时，会发送恢复通知。如果 Claude 反复提示需要重新登录，可以发送 `/diagnose` 查看脱敏诊断信息，重点关注 `refresh token`、`可自动刷新` 和 `token 状态`。
+
+`/diagnose` 还会查询重置卡数量，展示自动使用配置、待执行任务、提醒和重试状态，
+不会使用卡片。重置卡查询失败时仍保留其余诊断及本地任务信息。
+限额恢复状态在 `/diagnose` 和 `/quota_refresh` 中均按 Claude、Codex 分组展示，
+窗口按计划时间排序，登录失效的任务明确标为暂停，并给出重新登录命令。
 
 ## 注意事项
 
