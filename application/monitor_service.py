@@ -4,7 +4,7 @@ import asyncio
 import logging
 import re
 from contextlib import suppress
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 import httpx
 
@@ -16,10 +16,11 @@ from domain.models import CheckResult, ProviderName, ProviderUsage, UsageWindow
 from infrastructure.auth.cli_login import CliLoginManager
 from infrastructure.notifications.telegram import TelegramClient
 from infrastructure.providers.claude import ClaudeUsageClient
-from infrastructure.providers.codex import CodexUsageClient
+from infrastructure.providers.codex import CodexSubscriptionError, CodexUsageClient
 from infrastructure.providers.codex_reset_credits import CodexResetCreditClient
 from infrastructure.providers.quota_refresh import QuotaRefreshClient, QuotaRefreshResult
 from infrastructure.storage.json_state import MonitorState
+from presentation.billing_formatter import format_codex_subscription
 from presentation.telegram_formatter import (
     format_diagnostics,
     format_error,
@@ -32,6 +33,7 @@ from presentation.telegram_formatter import (
     format_recovery,
     format_report,
 )
+from shared.utils import html_escape
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +45,8 @@ _LEGACY_ALERT_KEY_PATTERN = re.compile(r"^(claude|codex):.+:(\d+|unknown)$")
 # up to a minute. Poll until the data reflects the new window before reporting.
 _REFRESH_REPORT_RETRY_SECONDS = 15.0
 _REFRESH_REPORT_MAX_CHECKS = 6
+_CODEX_RENEWAL_CHECK_INTERVAL_SECONDS = 3600
+_CODEX_RENEWAL_RETRY_SECONDS = 300
 
 
 class LimitMonitor:
@@ -92,11 +96,24 @@ class LimitMonitor:
     async def report(
         self, result: CheckResult, logins: dict[str, LoginStartResult] | None = None,
     ) -> str:
-        statistics = (
-            await self._reset_credits.statistics() if self._settings.codex_enabled
-            else "<b>Codex 重置卡</b>\nCodex 监控已关闭"
+        billing = None
+        statistics = "<b>Codex 重置卡</b>\nCodex 监控已关闭"
+        if self._settings.codex_enabled:
+            statistics, billing = await asyncio.gather(
+                self._reset_credits.statistics(), self._codex_billing_section(),
+            )
+        return format_report(
+            result, self._settings, logins, reset_credits=statistics, codex_billing=billing,
         )
-        return format_report(result, self._settings, logins, reset_credits=statistics)
+
+    async def _codex_billing_section(self) -> str:
+        now = datetime.now(tz=UTC)
+        try:
+            subscription = await self._codex.fetch_subscription(now)
+            text = format_codex_subscription(subscription, now, self._settings.timezone)
+        except CodexSubscriptionError as exc:
+            text = f"下次续费日期：查询失败（{exc}）"
+        return f"<b>Codex 续费</b>\n{html_escape(text)}"
 
     async def check(self) -> CheckResult:
         async with self._check_lock:
@@ -170,6 +187,10 @@ class LimitMonitor:
             tasks.append(asyncio.create_task(
                 self._reset_credits.run_loop(stop_event), name="reset-credit-loop",
             ))
+            if self._settings.codex_renewal_reminder_days:
+                tasks.append(asyncio.create_task(
+                    self._codex_renewal_loop(stop_event), name="codex-renewal-loop",
+                ))
         try:
             await asyncio.gather(*tasks)
         finally:
@@ -194,10 +215,12 @@ class LimitMonitor:
             result = await self.check()
             claude_auth = self._claude.diagnose_auth(result.captured_at)
             codex_auth = self._codex.diagnose_auth(result.captured_at)
-            reset_credits = (
-                await self._reset_credits.diagnostics() if self._settings.codex_enabled
-                else "<b>Codex 重置卡</b>\nCodex 监控已关闭"
-            )
+            billing = None
+            reset_credits = "<b>Codex 重置卡</b>\nCodex 监控已关闭"
+            if self._settings.codex_enabled:
+                reset_credits, billing = await asyncio.gather(
+                    self._reset_credits.diagnostics(), self._codex_billing_section(),
+                )
             return format_diagnostics(
                 result,
                 self._settings,
@@ -205,6 +228,7 @@ class LimitMonitor:
                 codex_auth,
                 self._quota_refresh.status_snapshot(),
                 reset_credits,
+                codex_billing=billing,
             )
         if command in {"/login", "/login_claude", "/login_codex"}:
             return await self._handle_login_command(command, text)
@@ -226,7 +250,7 @@ class LimitMonitor:
             "命令：\n"
             "/check - 检查 Claude 和 Codex 登录状态\n"
             "/monitor - 立即监控并返回完整报告\n"
-            "/diagnose - 输出脱敏诊断信息，含重置卡和自动任务\n"
+            "/diagnose - 输出脱敏诊断信息，含续费日期和自动任务\n"
             "/login_claude - 生成 Claude 登录链接\n"
             "/login_codex - 生成 Codex 登录链接和验证码\n"
             "/login_code claude CODE - 提交 Claude 登录页返回的 code\n"
@@ -410,6 +434,43 @@ class LimitMonitor:
             except Exception:
                 logger.exception("monitor loop iteration failed")
                 await asyncio.sleep(5)
+
+    async def _codex_renewal_loop(self, stop_event: asyncio.Event) -> None:
+        while not stop_event.is_set():
+            delay = await self._check_codex_renewal_reminder()
+            with suppress(TimeoutError):
+                await asyncio.wait_for(stop_event.wait(), timeout=delay)
+
+    async def _check_codex_renewal_reminder(self) -> float:
+        try:
+            subscription = await self._codex.fetch_subscription(datetime.now(tz=UTC))
+            now = datetime.now(tz=UTC)
+            remaining = subscription.remaining_days(now)
+            if subscription.renews_at is None or not remaining:
+                return _CODEX_RENEWAL_CHECK_INTERVAL_SECONDS
+
+            thresholds = self._settings.codex_renewal_reminder_days
+            due = next((days for days in thresholds if remaining <= days), None)
+            key = f"{subscription.account_id}:{subscription.renews_at.isoformat()}"
+            reminders = self._state.codex_renewal_reminders
+            previous = reminders.get(key)
+            if due is not None and (previous is None or due < previous):
+                text = format_codex_subscription(subscription, now, self._settings.timezone)
+                await self._telegram.send_message(
+                    f"<b>Codex 续费提醒（{due} 天提醒）</b>\n{html_escape(text)}"
+                )
+                reminders[key] = due
+                self._state.save(self._settings.state_path)
+
+            next_threshold = next((days for days in reversed(thresholds) if days < remaining), 0)
+            next_check = subscription.renews_at - timedelta(days=next_threshold)
+            delay = (next_check - datetime.now(tz=UTC)).total_seconds()
+            return max(1.0, min(_CODEX_RENEWAL_CHECK_INTERVAL_SECONDS, delay))
+        except CodexSubscriptionError as exc:
+            logger.warning("Codex renewal query failed: %s", exc)
+        except Exception as exc:
+            logger.warning("Codex renewal reminder failed: %s", type(exc).__name__)
+        return _CODEX_RENEWAL_RETRY_SECONDS
 
     async def _login_completion_loop(self, stop_event: asyncio.Event) -> None:
         logger.info("login completion loop started")

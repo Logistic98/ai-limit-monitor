@@ -55,6 +55,8 @@ class ResetCreditTest(unittest.IsolatedAsyncioTestCase):
     async def test_schedule_remind_day_before_use_and_consume_one_hour_before_expiry(self):
         report = await self.service.query()
         self.assertIn("可用数量：1", report)
+        self.assertIn("（剩余 1 天 3 小时）", report)
+        self.assertIn("（剩余 1 天 2 小时）", report)
         self.assertEqual(self.notify.await_count, 1)
         self.assertIn("已创建", self.notify.call_args.args[0])
         self.now = self.expiry - 90001
@@ -73,6 +75,16 @@ class ResetCreditTest(unittest.IsolatedAsyncioTestCase):
         await self.new_service().run_due()
         self.assertEqual(self.client.consume.await_count, 1)
         self.assertEqual(self.notify.await_count, 3)
+
+    async def test_reset_summary_and_diagnostics_show_countdowns(self) -> None:
+        report = await self.service.statistics()
+        self.assertIn("最近到期：", report)
+        self.assertIn("（剩余 1 天 3 小时）", report)
+        self.assertIn("（剩余 1 天 2 小时）", report)
+        diagnostics = await self.service.diagnostics()
+        self.assertIn("失败重试间隔：5 分钟", diagnostics)
+        self.assertIn("提前提醒：计划使用前 1 天", diagnostics)
+        self.assertIn("（剩余 2 小时 46 分钟）", diagnostics)
 
     async def test_late_discovery_warns_immediately_and_expired_unknown_cards_are_not_used(self):
         self.summary["credits"] = [

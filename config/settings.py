@@ -62,6 +62,9 @@ class Settings(BaseSettings):
     codex_refresh_before_seconds: int = Field(default=300, ge=0)
     codex_access_token: SecretStr | None = None
     codex_account_id: str | None = None
+    codex_renewal_reminder_days: Annotated[list[Annotated[int, Field(gt=0)]], NoDecode] = Field(
+        default_factory=lambda: [1, 3, 7, 14]
+    )
     codex_reset_auto_enabled: bool = True
     codex_reset_check_interval_seconds: int = Field(default=600, ge=30)
     codex_reset_use_before_seconds: int = Field(default=3600, ge=1)
@@ -78,6 +81,11 @@ class Settings(BaseSettings):
     def parse_alert_thresholds(cls, value: Any) -> list[float]:
         values = _parse_float_csv(value)
         return sorted(set(values))
+
+    @field_validator("codex_renewal_reminder_days", mode="before")
+    @classmethod
+    def parse_codex_renewal_reminder_days(cls, value: Any) -> list[int]:
+        return sorted({int(item) for item in _parse_csv(value)})
 
     @model_validator(mode="after")
     def default_allowed_chat_ids(self) -> Settings:

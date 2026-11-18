@@ -15,7 +15,11 @@ from uuid import uuid4
 from application.quota_refresh_service import _wait_for_stop_or_wake
 from infrastructure.providers.codex_reset_credits import CodexResetCreditClient
 from infrastructure.storage.json_state import MonitorState
-from presentation.reset_credits_formatter import credit_time, format_reset_credits, format_reset_tasks
+from presentation.reset_credits_formatter import (
+    credit_time,
+    format_reset_credits,
+    format_reset_tasks,
+)
 
 logger = logging.getLogger(__name__)
 _SUCCESS = {"reset", "alreadyRedeemed"}
@@ -124,7 +128,7 @@ class ResetCreditService:
             self._wake.set()
             return format_reset_credits(
                 summary, self._state.reset_credit_auto_enabled, self._timezone,
-                self._use_before_seconds,
+                self._use_before_seconds, now=self._clock(),
             )
 
     async def tasks(self) -> str:
@@ -161,19 +165,20 @@ class ResetCreditService:
                 if summary is None:
                     return "\n".join([*lines, "可用数量：未知（服务端未提供信息）"])
                 lines.append(f"可用数量：{summary['availableCount']}")
+                now = self._clock()
                 cards = [
                     card for card in summary.get("credits") or []
                     if card.get("status") == "available"
                     and card.get("resetType") == "codexRateLimits"
                     and card.get("expiresAt") is not None
-                    and card["expiresAt"] > self._clock()
+                    and card["expiresAt"] > now
                 ]
                 if cards:
                     expiry = min(card["expiresAt"] for card in cards)
-                    lines.append(f"最近到期：{credit_time(expiry, self._timezone)}")
+                    lines.append(f"最近到期：{credit_time(expiry, self._timezone, now=now)}")
                     if self._state.reset_credit_auto_enabled:
                         use_at = expiry - self._use_before_seconds
-                        lines.append(f"计划使用：{credit_time(use_at, self._timezone)}")
+                        lines.append(f"计划使用：{credit_time(use_at, self._timezone, now=now)}")
                 elif summary["availableCount"]:
                     lines.append("最近到期：暂无明确到期信息")
                 return "\n".join(lines)
@@ -233,10 +238,13 @@ class ResetCreditService:
                     f"ai-limit-monitor reset-codex-use --confirm {token}" if context == "cli"
                     else f"/reset_codex_use confirm {token}"
                 )
+                expiry = credit_time(
+                    jobs[credit_id].get("expires_at"), self._timezone, now=self._clock(),
+                )
                 return (
                     "<b>请二次确认使用 Codex 重置卡</b>\n"
                     f"卡片：<code>{escape(credit_id)}</code>\n"
-                    f"到期：{credit_time(jobs[credit_id].get('expires_at'), self._timezone)}\n"
+                    f"到期：{expiry}\n"
                     "使用后无法撤销。请在 5 分钟内发送以下命令确认：\n"
                     f"<code>{command}</code>\n未确认不会发起本次手动使用。"
                 )
@@ -295,23 +303,22 @@ class ResetCreditService:
             if not self._state.reset_credit_auto_enabled:
                 continue
             use_at = expiry - self._use_before_seconds
+            remind_at = use_at - self._notify_before_seconds
             if not job.get("scheduled_notified"):
+                now = self._clock()
                 job["scheduled_notified"] = await self._send(
                     f"<b>已创建 Codex 重置卡定时任务</b>\n{label}"
-                    f"到期：{credit_time(expiry, self._timezone)}\n"
-                    f"计划使用：{credit_time(use_at, self._timezone)}\n"
-                    f"提前提醒：{credit_time(use_at - self._notify_before_seconds, self._timezone)}"
+                    f"到期：{credit_time(expiry, self._timezone, now=now)}\n"
+                    f"计划使用：{credit_time(use_at, self._timezone, now=now)}\n"
+                    f"提前提醒：{credit_time(remind_at, self._timezone, now=now)}"
                 )
                 self._save()
-            if (
-                not job.get("warning_notified")
-                and self._clock() >= use_at - self._notify_before_seconds
-            ):
+            now = self._clock()
+            if not job.get("warning_notified") and now >= remind_at:
                 job["warning_notified"] = await self._send(
                     f"<b>Codex 重置卡使用前提醒</b>\n{label}"
-                    f"计划使用：{credit_time(use_at, self._timezone)}\n"
-                    f"到期：{credit_time(expiry, self._timezone)}\n"
-                    "距计划使用已进入提前提醒时段，将按计划自动使用。"
+                    f"计划使用：{credit_time(use_at, self._timezone, now=now)}\n"
+                    f"到期：{credit_time(expiry, self._timezone, now=now)}"
                 )
                 self._save()
 

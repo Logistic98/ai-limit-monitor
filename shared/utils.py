@@ -78,20 +78,41 @@ def local_time(value: datetime | None, timezone: str) -> str:
     return value.astimezone(zone).strftime("%Y-%m-%d %H:%M")
 
 
+def format_duration(seconds: float) -> str:
+    days, rest = divmod(int(seconds), 86400)
+    hours, rest = divmod(rest, 3600)
+    minutes, seconds = divmod(rest, 60)
+    for value, unit, smaller, smaller_unit in (
+        (days, "天", hours, "小时"),
+        (hours, "小时", minutes, "分钟"),
+        (minutes, "分钟", seconds, "秒"),
+    ):
+        if value:
+            tail = f" {smaller} {smaller_unit}" if smaller else ""
+            return f"{value} {unit}{tail}"
+    return f"{seconds} 秒"
+
+
+def local_time_with_countdown(value: datetime, timezone: str, now: datetime) -> str:
+    date = local_time(value, timezone)
+    seconds = (value.astimezone(UTC) - now.astimezone(UTC)).total_seconds()
+    if seconds == 0:
+        return f"{date}（已到时间）"
+    duration = format_duration(abs(seconds)) if abs(seconds) >= 1 else "不足 1 秒"
+    label = "剩余" if seconds > 0 else "已过"
+    return f"{date}（{label} {duration}）"
+
+
 def window_label_from_minutes(minutes: int | None, *, secondary: bool = False) -> str:
-    if minutes == 300:
-        return "5h limit"
-    if minutes == 10080:
-        return "7d limit"
     if minutes is None or minutes <= 0:
-        return "Secondary usage limit" if secondary else "Usage limit"
+        return "次级额度" if secondary else "额度"
     if minutes % 1440 == 0:
         days = minutes // 1440
-        return f"{days}d limit"
+        return f"{days} 天额度"
     if minutes % 60 == 0:
         hours = minutes // 60
-        return f"{hours}h limit"
-    return f"{minutes}m limit"
+        return f"{hours} 小时额度"
+    return f"{minutes} 分钟额度"
 
 
 def html_escape(value: object) -> str:

@@ -291,12 +291,12 @@ class ClaudeUsageClient:
     @staticmethod
     def parse_usage(payload: dict[str, Any]) -> tuple[list[UsageWindow], CreditInfo | None]:
         field_labels = {
-            "five_hour": "5h limit",
-            "seven_day": "7d limit",
-            "seven_day_sonnet": "Sonnet 7d limit",
-            "seven_day_opus": "Opus 7d limit",
-            "seven_day_omelette": "Opus 7d limit",
-            "seven_day_cowork": "Cowork 7d limit",
+            "five_hour": "5 小时额度",
+            "seven_day": "7 天额度",
+            "seven_day_sonnet": "Sonnet 7 天额度",
+            "seven_day_opus": "Opus 7 天额度",
+            "seven_day_omelette": "Opus 7 天额度",
+            "seven_day_cowork": "Cowork 7 天额度",
         }
         windows: list[UsageWindow] = []
         for key, label in field_labels.items():

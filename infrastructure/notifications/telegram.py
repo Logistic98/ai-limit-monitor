@@ -64,7 +64,7 @@ class TelegramClient:
         commands = [
             {"command": "check", "description": "检查登录状态"},
             {"command": "monitor", "description": "立即监控并返回完整报告"},
-            {"command": "diagnose", "description": "查看登录、重置卡和自动任务诊断"},
+            {"command": "diagnose", "description": "查看登录、续费和自动任务诊断"},
             {"command": "login_claude", "description": "生成 Claude 登录链接"},
             {"command": "login_codex", "description": "生成 Codex 登录链接和验证码"},
             {"command": "login_code", "description": "提交 Claude 登录 code"},

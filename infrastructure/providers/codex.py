@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import asyncio
 import contextlib
+import fcntl
 import json
 import logging
 from dataclasses import dataclass
@@ -11,7 +13,13 @@ from typing import Any
 import httpx
 
 from config.settings import Settings
-from domain.models import CreditInfo, ErrorKind, ProviderUsage, UsageWindow
+from domain.models import (
+    CodexSubscription,
+    CreditInfo,
+    ErrorKind,
+    ProviderUsage,
+    UsageWindow,
+)
 from shared.utils import (
     first_existing_path,
     jwt_payload,
@@ -22,6 +30,11 @@ from shared.utils import (
 )
 
 logger = logging.getLogger(__name__)
+_SUBSCRIPTION_URL = "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27"
+
+
+class CodexSubscriptionError(ValueError):
+    """A subscription error safe to show in command output."""
 
 
 @dataclass(frozen=True)
@@ -57,6 +70,7 @@ class CodexUsageClient:
     def __init__(self, settings: Settings, http: httpx.AsyncClient) -> None:
         self._settings = settings
         self._http = http
+        self._refresh_lock = asyncio.Lock()
 
     async def fetch(self, captured_at: datetime) -> ProviderUsage:
         if not self._settings.codex_enabled:
@@ -211,7 +225,69 @@ class CodexUsageClient:
 
         return windows, credits
 
+    async def fetch_subscription(self, captured_at: datetime) -> CodexSubscription:
+        account_id, payload = await self._fetch_subscription_payload(captured_at)
+        if nested_get(payload, "accounts", account_id, "account", "account_id") != account_id:
+            raise CodexSubscriptionError("订阅响应缺少当前 Codex 账号。")
+        entitlement = nested_get(payload, "accounts", account_id, "entitlement")
+        active = nested_get(entitlement, "has_active_subscription")
+        if type(active) is not bool:
+            raise CodexSubscriptionError("订阅状态缺失或格式异常。")
+        will_renew = nested_get(
+            payload, "accounts", account_id, "last_active_subscription", "will_renew",
+        )
+        cancels_at = _subscription_datetime(entitlement.get("cancels_at"))
+        renewable = (
+            active and will_renew is True and entitlement.get("is_delinquent") is False
+            and "cancels_at" in entitlement and entitlement["cancels_at"] is None
+        )
+        renews = True if renewable else None
+        if will_renew is False or cancels_at is not None:
+            renews = False
+        return CodexSubscription(
+            account_id=account_id,
+            active=active,
+            will_renew=renews,
+            renews_at=_subscription_datetime(entitlement.get("renews_at")) if renewable else None,
+            cancels_at=cancels_at,
+        )
+
+    async def _fetch_subscription_payload(
+        self, captured_at: datetime,
+    ) -> tuple[str, dict[str, Any]]:
+        if not self._settings.codex_enabled:
+            raise CodexSubscriptionError("Codex 监控已关闭。")
+        auth = self._load_auth()
+        account_id = auth.account_id
+        if not auth.access_token or not account_id:
+            raise CodexSubscriptionError("缺少 Codex 登录凭据或 ChatGPT 账号 ID。")
+
+        refreshed = auth.should_refresh(captured_at, self._settings.codex_refresh_before_seconds)
+        if refreshed:
+            result = await self._refresh_access_token(auth, captured_at)
+            if result.auth is None:
+                raise CodexSubscriptionError("Codex 登录凭据暂无法刷新。")
+            auth = result.auth
+        try:
+            try:
+                return account_id, await self._get_payload(_SUBSCRIPTION_URL, auth)
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code != 401 or refreshed or not auth.refresh_token:
+                    raise
+                result = await self._refresh_access_token(auth, captured_at)
+                if result.auth is None:
+                    raise
+                return account_id, await self._get_payload(_SUBSCRIPTION_URL, result.auth)
+        except httpx.HTTPStatusError as exc:
+            status = exc.response.status_code
+            raise CodexSubscriptionError(f"订阅接口暂不可用（HTTP {status}）。") from None
+        except (ValueError, httpx.RequestError):
+            raise CodexSubscriptionError("订阅请求失败或返回格式异常。") from None
+
     async def _fetch_usage_payload(self, auth: CodexAuth) -> dict[str, Any]:
+        return await self._get_payload(self._settings.codex_usage_url, auth)
+
+    async def _get_payload(self, url: str, auth: CodexAuth) -> dict[str, Any]:
         headers = {
             "Authorization": f"Bearer {auth.access_token}",
             "Accept": "application/json",
@@ -219,14 +295,43 @@ class CodexUsageClient:
         }
         if auth.account_id:
             headers["ChatGPT-Account-Id"] = auth.account_id
-        response = await self._http.get(self._settings.codex_usage_url, headers=headers)
+        response = await self._http.get(url, headers=headers, follow_redirects=False)
         response.raise_for_status()
         payload = response.json()
         if not isinstance(payload, dict):
-            raise ValueError("Codex usage API returned non-object JSON")
+            raise ValueError("Codex API returned non-object JSON")
         return payload
 
     async def _refresh_access_token(
+        self, auth: CodexAuth, captured_at: datetime,
+    ) -> CodexRefreshResult:
+        if auth.auth_path is None or not auth.refresh_token:
+            return await self._exchange_refresh_token(auth, captured_at)
+        try:
+            lock_path = auth.auth_path.resolve().with_suffix(".refresh.lock")
+            async with self._refresh_lock:
+                with lock_path.open("a") as lock:
+                    async with asyncio.timeout(self._settings.http_timeout_seconds):
+                        while True:
+                            try:
+                                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                                break
+                            except BlockingIOError:
+                                await asyncio.sleep(0.05)
+                    current = self._load_auth()
+                    if auth.account_id != current.account_id or not current.access_token:
+                        return CodexRefreshResult(
+                            error="Codex 登录已变更，请重试。", error_kind="auth_required",
+                        )
+                    if current.access_token != auth.access_token:
+                        return CodexRefreshResult(auth=current)
+                    return await self._exchange_refresh_token(current, captured_at)
+        except (OSError, TimeoutError):
+            return CodexRefreshResult(
+                error="Codex 登录凭据暂无法锁定。", error_kind="request_failed",
+            )
+
+    async def _exchange_refresh_token(
         self,
         auth: CodexAuth,
         captured_at: datetime,
@@ -497,6 +602,16 @@ class CodexUsageClient:
             expires_at=_access_token_expiry(access_token),
             auth_path=auth_path,
         )
+
+
+def _subscription_datetime(value: Any) -> datetime | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+        return parsed.astimezone(UTC) if parsed.tzinfo is not None else None
+    except (ValueError, OverflowError):
+        return None
 
 
 def _rate_limited_window(response: httpx.Response, captured_at: datetime) -> UsageWindow:

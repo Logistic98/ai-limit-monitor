@@ -21,6 +21,7 @@ class MonitorState:
     quota_refresh_last_success_at: dict[str, float] = field(default_factory=dict)
     quota_refresh_last_errors: dict[str, str] = field(default_factory=dict)
     quota_refresh_auth_blocked: dict[str, bool] = field(default_factory=dict)
+    codex_renewal_reminders: dict[str, int] = field(default_factory=dict)
     reset_credit_auto_enabled: bool = True
     reset_credit_jobs: dict[str, dict[str, Any]] = field(default_factory=dict)
     reset_credit_config: dict[str, Any] = field(default_factory=dict)
@@ -48,6 +49,7 @@ class MonitorState:
             quota_refresh_last_success_at=_dict_float(data.get("quota_refresh_last_success_at")),
             quota_refresh_last_errors=_dict_str(data.get("quota_refresh_last_errors")),
             quota_refresh_auth_blocked=_dict_bool(data.get("quota_refresh_auth_blocked")),
+            codex_renewal_reminders=_dict_int(data.get("codex_renewal_reminders")),
             reset_credit_auto_enabled=_strict_bool(
                 data.get("reset_credit_auto_enabled"), default=True,
             ),
@@ -78,6 +80,7 @@ class MonitorState:
                     "quota_refresh_last_success_at": self.quota_refresh_last_success_at,
                     "quota_refresh_last_errors": self.quota_refresh_last_errors,
                     "quota_refresh_auth_blocked": self.quota_refresh_auth_blocked,
+                    "codex_renewal_reminders": self.codex_renewal_reminders,
                     "reset_credit_auto_enabled": self.reset_credit_auto_enabled,
                     "reset_credit_jobs": self.reset_credit_jobs,
                     "reset_credit_config": self.reset_credit_config,

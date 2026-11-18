@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime
+from math import ceil
 from typing import Any, Literal
 
 ProviderName = Literal["claude", "codex"]
@@ -72,3 +73,17 @@ class CheckResult:
     @property
     def ok(self) -> bool:
         return all(provider.ok for provider in self.providers)
+
+
+@dataclass(frozen=True)
+class CodexSubscription:
+    account_id: str
+    active: bool
+    will_renew: bool | None
+    renews_at: datetime | None = None
+    cancels_at: datetime | None = None
+
+    def remaining_days(self, now: datetime) -> int | None:
+        if self.renews_at is None:
+            return None
+        return max(0, ceil((self.renews_at - now).total_seconds() / 86400))
