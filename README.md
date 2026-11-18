@@ -1,373 +1,72 @@
 # AI Limit Monitor
 
-AI Limit Monitor 是一个使用 Python 编写的 Claude Code 与 OpenAI Codex 限额监控服务。项目使用 uv 管理依赖，支持 Docker Compose 部署，并通过 Telegram Bot 推送定时报告、阈值告警、错误恢复通知和容器内浏览器登录流程。
+长任务开跑前，想知道 Claude Code 和 Codex 哪边还有额度、多久会重置，通常要分别去查。AI Limit Monitor 在服务器后台持续监控，把两边的用量和重置倒计时汇总到 Telegram。用量跨过设定的阈值时，机器人会主动发来报告，方便你及时安排后续任务。
 
-项目参考了以下开源项目和实现思路：
+## 功能特性
 
-- [kai-denrei/claude-usage-monitor](https://github.com/kai-denrei/claude-usage-monitor)：Claude Code OAuth usage API 读取方式。
-- [mokyiichek/ClaudeUsageMonitorByAPI](https://github.com/mokyiichek/ClaudeUsageMonitorByAPI)：Claude Code 配额定时 Telegram 汇报思路。
-- [Keshkov/AI-Limit-Tracker-bot](https://github.com/Keshkov/AI-Limit-Tracker-bot)：Telegram Bot 形式的限额提醒体验。
-- OpenAI Codex CLI 当前源码中的 `/wham/usage` 调用方式和 rate limit payload 结构。
+- **用量与重置倒计时**。查看会员的额度窗口已用多少、何时自然重置、还要等多久，达到阈值时通知。
+- **额度恢复后自动开启新窗口**。额度重置后，服务可自动发起一次轻量请求，让下一轮窗口开始计时，在有5h限额时，方便使用连续两个时间窗口的配额。
+- **重置卡到期前自动使用**。查看可用重置卡片和到期时间。开启自动使用后，服务会在到期前安排用卡，并在执行前提醒，手动使用需二次确认。
+- **会员续费提醒**。查看下次续费时间和倒计时，并按在续费日期前收到续费通知，以防止会员中断。
 
-## 功能
+## 快速开始
 
-- 实时读取 Claude Code 限额：调用 `https://api.anthropic.com/api/oauth/usage`，解析 5 小时、7 天、Sonnet、Opus、Cowork 等窗口。
-- 实时读取 Codex 限额：调用 `https://chatgpt.com/backend-api/wham/usage`，解析 Codex 主窗口、7 天窗口、附加模型窗口、credit / spend control 信息。
-- Telegram Bot 通知：支持周期性报告、阈值告警、错误告警、恢复通知和登录辅助命令；阈值告警与 /monitor 使用同一种完整报告形式。
-- 阈值去重：默认在 50%、70%、80%、90%、100% 用量阈值跨越时推送一次完整报告，同一个重置窗口内不会重复发送相同阈值。
-- 上限识别：当 Claude usage API 返回 HTTP 429 限流时，识别为额度已达上限并在报告中以 100% 窗口呈现，而非误报为异常或要求重新登录。
-- 限额恢复主动请求：Claude 或 Codex 的任意限额窗口达到上限后，记录其重置时间，到期恢复时立即通过官方 CLI 发起一个最小请求；默认开启，可通过 Telegram 命令随时关闭或重新开启。
-- Docker 部署：镜像内置 Claude Code CLI 与 Codex CLI，通过 Telegram 生成浏览器登录链接，登录态保存在 Docker named volume 中。
-
-## 工程结构
-
-项目代码目录直接放在仓库根目录，并按职责分层，避免业务逻辑、外部 API、配置和展示格式混在一起。
-
-```text
-ai-limit-monitor/
-├── application/                  # 应用服务层：调度、检查、通知编排
-│   └── monitor_service.py
-├── config/                       # 配置层：环境变量与运行配置
-│   └── settings.py
-├── domain/                       # 领域层：ProviderUsage、UsageWindow、登录结果等核心模型
-│   ├── auth.py
-│   └── models.py
-├── infrastructure/               # 基础设施层：外部系统适配器
-│   ├── auth/                     # 容器内 Claude / Codex CLI 登录流程
-│   ├── notifications/            # Telegram Bot API 客户端
-│   ├── providers/                # Claude / Codex usage API 客户端
-│   └── storage/                  # JSON 状态存储
-├── presentation/                 # 展示层：Telegram 消息格式化
-├── shared/                       # 通用工具函数
-├── cli.py                        # 命令行入口
-├── __main__.py
-├── Dockerfile
-├── docker-compose.yml
-├── pyproject.toml
-└── uv.lock
-```
-
-依赖方向保持为：`cli -> application -> infrastructure / presentation -> domain`。领域模型不依赖具体外部服务，Claude、Codex、Telegram、状态文件都放在基础设施层，后续替换通知渠道或新增 provider 不需要改核心模型。
-
-## Telegram 命令
-
-启动服务后，可以在允许的 Telegram Chat 中发送以下命令：
-
-```text
-/start                  显示帮助
-/help                   显示帮助
-/check                  检查 Claude 和 Codex 登录状态
-/monitor                立即监控并返回完整报告
-/diagnose               查看脱敏诊断，含登录、重置卡数量、自动配置和任务状态
-/login_claude           生成 Claude 浏览器登录链接
-/login_codex            生成 Codex 浏览器登录链接和验证码
-/login_code claude CODE 提交 Claude 登录页返回的 code
-/quota_refresh           查看限额恢复主动请求状态（含待执行窗口与最近结果）
-/quota_refresh on        开启限额恢复主动请求
-/quota_refresh off       关闭限额恢复主动请求
-/quota_refresh claude|codex  立即手动发起一次限额恢复请求
-/reset_codex_cards       查询 Codex 重置卡数量、到期时间和计划使用时间
-/reset_codex_tasks       查询自动使用任务、提醒时间和重试状态
-/reset_codex_use         选择最近到期的 Codex 重置卡，需二次确认后使用
-/reset_codex_auto on|off 开启或关闭 Codex 重置卡到期自动使用（默认开启）
-/ping                   健康检查
-```
-
-注意：同一个 Telegram Bot token 同一时间只能有一个消息接收端。如果日志出现 `Conflict: terminated by other getUpdates request`，需要停止另一个 Bot 实例，或为本服务更换独立的 Bot token。
-
-`/monitor` 的完整报告同时包含 Codex 重置卡可用数量、自动使用开关、最近到期时间和
-计划使用时间。读取统计不会使用卡片；查询失败时仍返回 Claude、Codex 的限额报告。
-
-## 本地开发
-
-安装依赖：
-
-```bash
-uv sync
-```
-
-代码检查：
-
-```bash
-uv run ruff check .
-```
-
-本地一次性检查：
-
-```bash
-uv run ai-limit-monitor once
-```
-
-发送 Telegram 测试消息：
-
-```bash
-uv run ai-limit-monitor send-test
-```
-
-启动长期服务：
-
-```bash
-uv run ai-limit-monitor run
-```
-
-## 配置
-
-复制配置模板：
+在装有 Docker 和 Compose 的服务器上进入项目目录。首次安装时复制配置模板。
 
 ```bash
 cp .env.example .env
 ```
 
-编辑 `.env`：
+在 `.env` 中填写 BotFather 提供的 `TELEGRAM_BOT_TOKEN` 和接收通知的 `TELEGRAM_CHAT_ID`。新建机器人时，可在服务启动前向机器人发送 `/start`，再调用 `getUpdates`，将响应中的 `message.chat.id` 填入 `TELEGRAM_CHAT_ID`。[Telegram Bot API](https://core.telegram.org/bots/api#getupdates)
 
-```env
-# Telegram Bot 配置
-# TELEGRAM_BOT_TOKEN：从 BotFather 获取的 Bot Token。
-TELEGRAM_BOT_TOKEN=replace-with-your-telegram-bot-token
-# TELEGRAM_CHAT_ID：接收通知的 Telegram Chat ID。
-TELEGRAM_CHAT_ID=replace-with-your-telegram-chat-id
-# TELEGRAM_ALLOWED_CHAT_IDS：允许使用 Bot 命令的 Chat ID，多个值用英文逗号分隔；留空时默认使用 TELEGRAM_CHAT_ID。
-TELEGRAM_ALLOWED_CHAT_IDS=
-
-# 监控调度配置
-# CHECK_INTERVAL_SECONDS：自动检查间隔，单位秒。
-CHECK_INTERVAL_SECONDS=600
-# SEND_STARTUP_REPORT：服务启动时是否立即发送一次完整报告。
-SEND_STARTUP_REPORT=true
-# ALERT_THRESHOLDS：用量告警阈值，多个值用英文逗号分隔；跨越阈值时推送完整报告。
-ALERT_THRESHOLDS=50,80,100
-# TIMEZONE：时间显示使用的时区。
-TIMEZONE=Asia/Shanghai
-# STATE_PATH：状态文件路径，用于记录告警去重和错误恢复状态。
-STATE_PATH=/data/state.json
-# HTTP_TIMEOUT_SECONDS：请求 Claude、Codex、Telegram API 的超时时间，单位秒。
-HTTP_TIMEOUT_SECONDS=20
-
-# Claude Code 限额读取配置
-# CLAUDE_ENABLED：是否启用 Claude 限额监控。
-CLAUDE_ENABLED=true
-# CLAUDE_USAGE_URL：Claude Code OAuth usage API 地址，一般不需要修改。
-CLAUDE_USAGE_URL=https://api.anthropic.com/api/oauth/usage
-# CLAUDE_TOKEN_URL：Claude Code OAuth token 刷新地址，一般不需要修改。
-CLAUDE_TOKEN_URL=https://platform.claude.com/v1/oauth/token
-# CLAUDE_OAUTH_CLIENT_ID：Claude Code OAuth 客户端 ID，一般不需要修改。
-CLAUDE_OAUTH_CLIENT_ID=9d1c250a-e61b-44d9-88ed-5944d1962f5e
-# CLAUDE_BETA_HEADER：Claude OAuth usage API 所需的 beta 标识，一般不需要修改。
-CLAUDE_BETA_HEADER=oauth-2025-04-20
-# CLAUDE_CREDENTIALS_PATH：容器内 Claude CLI 登录凭据路径，不需要手动填写 access token。
-CLAUDE_CREDENTIALS_PATH=/root/.claude/.credentials.json
-# CLAUDE_REFRESH_BEFORE_SECONDS：Claude access token 过期前多少秒主动刷新。
-CLAUDE_REFRESH_BEFORE_SECONDS=300
-
-# Codex 限额读取配置
-# CODEX_ENABLED：是否启用 Codex 限额监控。
-CODEX_ENABLED=true
-# CODEX_USAGE_URL：Codex usage API 地址，一般不需要修改。
-CODEX_USAGE_URL=https://chatgpt.com/backend-api/wham/usage
-# CODEX_TOKEN_URL：Codex OAuth token 刷新地址，一般不需要修改。
-CODEX_TOKEN_URL=https://auth.openai.com/oauth/token
-# CODEX_OAUTH_CLIENT_ID：Codex CLI OAuth 客户端 ID，一般不需要修改。
-CODEX_OAUTH_CLIENT_ID=app_EMoamEEZ73f0CkXaXp7hrann
-# CODEX_AUTH_PATH：容器内 Codex CLI 登录凭据路径，不需要手动填写 access token。
-CODEX_AUTH_PATH=/root/.codex/auth.json
-# CODEX_REFRESH_BEFORE_SECONDS：Codex access token 过期前多少秒主动刷新。
-CODEX_REFRESH_BEFORE_SECONDS=300
-```
-
-安全建议：不要把 `.env` 提交到 Git。项目已经在 `.gitignore` 中忽略 `.env` 和 `.env.*`。常规部署不需要在 `.env` 中手填 Claude 或 Codex 的 access token。Claude 和 Codex 的 access token 都是短期 token，本服务会读取各自凭据文件中的 refresh token，在过期前自动刷新并写回凭据文件；只有 refresh token 也失效、登录被撤销或账号无权访问 usage API 时，才需要重新登录。
-
-## 状态存储
-
-### Codex 重置卡
-
-服务通过已登录的 `codex app-server` 查询 `account/rateLimits/read`，按服务端的
-`availableCount` 显示数量，并读取卡片 ID、发放时间和到期时间。默认每
-`CODEX_RESET_CHECK_INTERVAL_SECONDS` 秒自动查询，默认在到期前 1 小时使用指定卡片，
-不会因为普通监控检查间隔而延迟执行。没有到期时间、明细未知或状态不明确的卡不会自动使用。
-
-创建计划时、计划使用前 1 天（即到期前 25 小时）以及使用后均通过 Telegram 通知。
-首次发现时距离计划使用不足 1 天会立即补发提醒。时间使用 `TIMEZONE`，默认北京时间，
-日期不带时区缩写。
-`nothingToReset`、`noCredit` 不算使用成功，在卡片到期前每 5 分钟重试，异常会通知，
-不会退回到由服务端任选其他卡片。已到期的卡不新发起使用；网络中断导致结果不明时，
-会保留原幂等键核实同一次使用结果。
-
-以下自动使用配置同时维护在 `.env` 和 `.env.example` 中，时间参数的单位均为秒：
-
-```env
-CODEX_RESET_AUTO_ENABLED=true
-CODEX_RESET_CHECK_INTERVAL_SECONDS=600
-CODEX_RESET_USE_BEFORE_SECONDS=3600
-CODEX_RESET_NOTIFY_BEFORE_SECONDS=86400
-CODEX_RESET_RETRY_SECONDS=300
-```
-
-分别控制初始开关、查询间隔、到期前多久使用、计划使用前多久提醒以及失败重试间隔。
-修改 `.env` 后执行 `docker compose up -d --no-build --force-recreate` 生效。
-Telegram 的 `/reset_codex_auto on|off` 会立即切换并持久化运行开关；如果 `.env` 中的
-`CODEX_RESET_AUTO_ENABLED` 发生变化，新值会覆盖之前的运行开关。修改使用或提醒时间后，
-系统会重新安排计划并发送任务通知。
-
-使用 `/reset_codex_tasks` 查询当前待执行的自动任务，包括开关、调度参数、计划使用时间、
-提醒时间、提醒是否已发送以及重试或结果待确认状态。该命令直接读取持久化任务，
-不会触发查询接口或使用卡片。
-
-手动命令同样支持本地或 Docker：
-
-```bash
-uv run ai-limit-monitor reset-codex-cards
-uv run ai-limit-monitor reset-codex-tasks
-uv run ai-limit-monitor reset-codex-use
-uv run ai-limit-monitor reset-codex-use --confirm CONFIRMATION_TOKEN
-uv run ai-limit-monitor reset-codex-auto off
-docker compose exec ai-limit-monitor /app/.venv/bin/ai-limit-monitor reset-codex-cards
-```
-
-手动使用需二次确认：`/reset_codex_use` 自动选择最近到期的可用卡，显示卡片和到期时间，
-并生成一次性确认码，无需指定卡片 ID。
-在同一个 Telegram 聊天中，于 5 分钟内发送 `/reset_codex_use confirm 确认码` 才会使用。
-CLI 使用返回的 `reset-codex-use --confirm 确认码` 完成确认。确认码只能使用一次，
-重新发起请求会替换当前聊天的旧确认码；卡片已失效时不会改用其他卡片。
-未确认不会发起本次手动使用，已开启的自动到期任务仍照常执行。
-
-任务、开关、提醒去重和使用幂等键单独保存在 `STATE_PATH` 同目录的
-`state.reset-credits.json`（文件名前缀随 `STATE_PATH` 变化），进程锁防止手动命令与自动任务
-重复用卡。保留 Docker 数据卷即可在重启后恢复。只有确实收到 `reset` 或
-`alreadyRedeemed` 才通知使用成功，随后重新查询服务端状态。关闭自动使用不影响手动操作，
-已发出的使用请求仍会核实结果。`CODEX_AUTH_PATH` 应指向 CLI 的 `auth.json`。
-
-协议依据：[Codex App Server](https://learn.chatgpt.com/docs/app-server) 的
-`account/rateLimitResetCredit/consume`，需要支持 `creditId` 的 Codex CLI。
-
-项目没有使用数据库，也没有 SQLite、MySQL、PostgreSQL 之类的依赖。`STATE_PATH=/data/state.json` 只是一个轻量 JSON 状态文件，用来记录：
-
-- 已经发送过哪些阈值告警，避免同一个重置窗口重复刷屏
-- provider 当前是否处于错误状态，避免登录失效或请求失败时重复通知
-- 上一次完整报告发送时间
-- 限额恢复主动请求开关、各限额窗口的待执行时间以及最近执行结果
-
-Docker Compose 使用 named volume `monitor-state` 挂载到容器内 `/data`，所以仓库里不需要 `data/` 目录。
-
-## 登录与凭据
-
-镜像内已经安装 Claude Code CLI 和 Codex CLI，登录流程在容器内执行，凭据保存在 Docker named volume 中，不需要在宿主机手动执行 `claude auth login` 或 `codex login`，也不需要把 access token 写入 `.env`。
-
-首次启动或登录失效时，Bot 会在 Telegram 中发送可点击的登录信息。也可以手动发送命令生成登录链接：
-
-```text
-/login_claude
-/login_codex
-```
-
-Claude 登录流程：Bot 会返回 Claude 登录页面链接。用浏览器打开并完成授权后，如果页面返回 code，把 code 发回 Bot：
-
-```text
-/login_code claude YOUR_CODE
-```
-
-Codex 登录流程：Bot 会返回 Codex device 登录页面和一次性验证码。用浏览器打开页面并输入验证码即可，容器内的 Codex CLI 会自动完成登录并保存凭据。
-
-登录态保存位置：
-
-```text
-claude-auth -> /root/.claude
-codex-auth  -> /root/.codex
-```
-
-当前默认读取路径：
-
-```text
-CLAUDE_CREDENTIALS_PATH=/root/.claude/.credentials.json
-CODEX_AUTH_PATH=/root/.codex/auth.json
-```
-
-## 限额恢复主动请求
-
-该功能默认开启。完整监控检查会扫描 Claude、Codex 返回的所有限额窗口；只要窗口带有重置时间，就记录下来，不看用量百分比——用量检查按 `CHECK_INTERVAL_SECONDS` 轮询，窗口可能在两次检查之间越过任何水位并到期重置，按用量设阈值必然漏触发，而一次多余的轻量请求是无害的。独立调度器按最早重置时间精确唤醒，到期后立即通过对应的已登录 CLI 发起一个只要求回复 `OK` 的最小请求，开启新的限额窗口；新窗口的重置时间又会被下一次检查记录，因此窗口会持续自动滚动。如果同一个 provider 有多个限额在相近时间同时恢复，只合并为一次请求，另一个 provider 仍独立执行。
-
-请求成功后会自动执行一次 `/monitor` 并推送最新报告。由于 usage API 在新窗口开启后有短暂延迟（读取结果仍显示旧窗口或缺少重置时间），报告会先轮询等待数据反映出新窗口（每 15 秒重查一次，最多 6 次），确认刷新后再发送；超过等待上限时按当前数据发送并记录日志。手动 `/quota_refresh claude|codex` 触发的报告采用同样的等待逻辑。
-
-Claude 请求禁用工具、MCP、会话持久化和 Chrome 集成，Codex 请求运行在临时目录及只读沙箱中并使用低推理强度。容器等环境中内核沙箱（Landlock/seccomp）不可用时，Codex 请求会自动降级为无内核沙箱重试一次（容器本身仍是隔离边界）。命令失败时会截取输出末尾用于诊断并出现在 Telegram 通知和日志中，凭据不会出现在命令参数中。没有重置时间的窗口以及 usage API 中缺失的窗口不会主动发起请求。请求失败不会中断限额监控，同一 provider 默认至少间隔 15 分钟重试一次，同一窗口最多尝试 4 次后放弃并通知。开关、每个窗口的待执行重置时间、失败次数和执行结果会持久化到 `STATE_PATH`，容器重启不会丢失。关闭功能只阻止后续请求，不会取消已经发出的 CLI 请求。
-
-Telegram 控制命令：
-
-```text
-/quota_refresh           查看当前状态（开关、待执行窗口、失败次数、最近成功/错误）
-/quota_refresh on        开启 Claude、Codex 的限额恢复主动请求
-/quota_refresh off       关闭 Claude、Codex 的限额恢复主动请求
-/quota_refresh claude|codex  跳过调度立即发起一次请求，用于远程排查
-```
-
-如果需要清除登录态，可以删除对应 Docker volume 后重新登录：
-
-```bash
-docker compose down
-docker volume rm ai-limit-monitor_claude-auth ai-limit-monitor_codex-auth
-```
-
-注意：Codex 的 device code 有时效；Claude 的 OAuth code 也有时效，生成后请尽快完成。
-
-## Docker Compose 部署
-
-准备 `.env` 后启动：
+如需在多个会话使用命令，将所有允许的会话 ID 用英文逗号分隔后填入 `TELEGRAM_ALLOWED_CHAT_IDS`。
 
 ```bash
 docker compose up -d --build
-```
-
-查看日志：
-
-```bash
-docker compose logs -f
-```
-
-查看状态：
-
-```bash
 docker compose ps
 ```
 
-镜像使用 `tini` 作为 PID 1，负责转发停止信号并回收退出的子进程。主服务直接从项目虚拟环境启动，健康检查也绕过 `uv run`，只读取 `/proc` 确认真正的监控进程仍由 `tini` 托管，避免健康检查超时后遗留僵尸进程或产生不必要的周期性启动负载。
+容器显示 `healthy` 后，在 Telegram 打开机器人私聊并发送 `/ping` 确认可以收到回复。容器启动异常时运行 `docker compose logs --tail=100 ai-limit-monitor`。
 
-停止服务：
+部署细节与排障详见[部署文档](doc/deployment.md)。
 
-```bash
-docker compose down
-```
+## 登录与 Telegram 命令
 
-一次性检查：
+- **Claude**。发送 `/login_claude` 并打开授权链接。页面如返回授权码，发送 `/login_code claude YOUR_CODE` 完成登录。
+- **Codex**。发送 `/login_codex`，打开登录链接并输入机器人给出的一次性验证码。
 
-```bash
-docker compose run --rm ai-limit-monitor uv run --no-sync ai-limit-monitor once
-```
+| 命令 | 用途 |
+|---|---|
+| `/check` | 检查 Claude 和 Codex 的登录状态 |
+| `/monitor` | 立即查询用量、重置倒计时、Codex 续费日期与倒计时，以及可用重置卡 |
+| `/diagnose`、`/debug` | 查看脱敏诊断，包含凭据有效期、Codex 续费日期与倒计时、自动任务状态和最近错误 |
+| `/login_claude`、`/login claude` | 获取 Claude 授权链接 |
+| `/login_codex`、`/login codex` | 获取 Codex 设备登录链接和一次性验证码 |
+| `/login_code claude 授权码`、`/login-code claude 授权码` | 提交 Claude 授权页返回的授权码 |
+| `/quota_refresh`、`/quota_refresh status` | 查看限额恢复任务状态 |
+| `/quota_refresh on`、`/quota_refresh off` | 开启或关闭额度恢复后的自动请求 |
+| `/quota_refresh claude`、`/quota_refresh codex` | 立即通过指定 CLI 发起一次轻量请求 |
+| `/reset_codex_cards` | 查询 Codex 可用重置卡、到期时间和计划使用时间 |
+| `/reset_codex_tasks` | 查看重置卡使用计划、提醒和失败重试状态 |
+| `/reset_codex_auto on`、`/reset_codex_auto off` | 开启或关闭重置卡自动使用 |
+| `/reset_codex_use` | 选出最早到期的可用卡片并生成确认码 |
+| `/reset_codex_use confirm 确认码` | 在同一会话确认用卡，确认码有效期为 5 分钟 |
+| `/ping` | 检查机器人是否在线 |
+| `/start`、`/help` | 显示命令帮助 |
 
-发送 Telegram 测试消息：
+操作示例与注意事项详见[使用文档](doc/usage.md)。
 
-```bash
-docker compose run --rm ai-limit-monitor uv run --no-sync ai-limit-monitor send-test
-```
+## 自动提醒和任务
 
-默认 `docker-compose.yml` 使用以下 named volumes：
+- **用量告警**。用量跨过配置阈值时，机器人会发送一份监控报告。
+- **Codex 续费提醒**。默认在续费前 14、7、3、1 天提醒。用 `CODEX_RENEWAL_REMINDER_DAYS` 调整天数，留空可停用提醒。
+- **限额恢复**。首次部署默认开启。额度窗口重置后会通过对应 CLI 发起一次轻量请求，用 `/quota_refresh off` 可关闭。
+- **Codex 重置卡**。首次部署默认在卡片到期前自动使用，用 `/reset_codex_auto off` 可关闭。手动使用时发送 `/reset_codex_use`，再按机器人回复二次确认。
 
-```text
-monitor-state -> /data
-claude-auth   -> /root/.claude
-codex-auth    -> /root/.codex
-```
+阈值、提醒时间和其他环境变量详见[配置说明](doc/configuration.md)。
 
-这些 volume 由 Docker 管理，仓库中不需要 `data/`、`.claude/` 或 `.codex/` 目录。
+## 更新和配置
 
-## 通知策略
+更新源码后重新运行 `docker compose up -d --build`。仅修改 `.env` 时运行 `docker compose up -d --no-build --force-recreate`。Docker 数据卷保存登录凭据、调度任务和提醒记录，更新时沿用现有数据卷。
 
-服务每 `CHECK_INTERVAL_SECONDS` 秒读取一次 Claude 和 Codex 用量，检查本身不发消息。只有以下情况会推送通知：某个窗口的用量向上跨越 `ALERT_THRESHOLDS` 中的阈值时推送一次完整报告作为告警（与 /monitor 形式相同）；限额恢复主动请求执行后推送结果；通过命令主动查询。状态保存在 `STATE_PATH` 中，因此容器重启后不会重复发送同一窗口的历史阈值告警。
-
-如果某个 provider 读取失败，会发送一次错误通知；当后续恢复成功时，会发送恢复通知。如果 Claude 反复提示需要重新登录，可以发送 `/diagnose` 查看脱敏诊断信息，重点关注 `refresh token`、`可自动刷新` 和 `token 状态`。
-
-`/diagnose` 还会查询重置卡数量，展示自动使用配置、待执行任务、提醒和重试状态，
-不会使用卡片。重置卡查询失败时仍保留其余诊断及本地任务信息。
-限额恢复状态在 `/diagnose` 和 `/quota_refresh` 中均按 Claude、Codex 分组展示，
-窗口按计划时间排序，登录失效的任务明确标为暂停，并给出重新登录命令。
-
-## 注意事项
-
-Claude 的 usage API 和 Codex 的 `/wham/usage` 都不是稳定的公开长期兼容接口，后续 CLI 或服务端变更可能导致字段结构变化。代码已经把 provider client 和 payload parser 独立封装，后续如果接口变化，只需要调整 `infrastructure/providers/claude.py` 或 `infrastructure/providers/codex.py`。
+本地开发与测试详见[开发规范](doc/development.md)。
